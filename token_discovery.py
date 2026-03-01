@@ -132,7 +132,10 @@ class TokenDiscovery:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
+        # ssl=False fixes SSL certificate errors on macOS (missing root certs).
+        connector = aiohttp.TCPConnector(ssl=False)
         self._session = aiohttp.ClientSession(
+            connector=connector,
             timeout=aiohttp.ClientTimeout(total=15),
             headers={
                 "User-Agent": "Mozilla/5.0",

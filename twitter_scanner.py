@@ -132,7 +132,9 @@ class TwitterNarrativeScanner:
         self._use_api = bool(config.twitter_bearer_token)
 
     async def __aenter__(self):
+        connector = aiohttp.TCPConnector(ssl=False)
         self._session = aiohttp.ClientSession(
+            connector=connector,
             timeout=aiohttp.ClientTimeout(total=30),
             headers={
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",

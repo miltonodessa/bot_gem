@@ -86,7 +86,9 @@ class JupiterClient:
         self._sol_price_ts: float = 0
 
     async def __aenter__(self):
+        connector = aiohttp.TCPConnector(ssl=False)
         self._session = aiohttp.ClientSession(
+            connector=connector,
             timeout=aiohttp.ClientTimeout(total=20),
             headers={"Accept": "application/json"},
         )
