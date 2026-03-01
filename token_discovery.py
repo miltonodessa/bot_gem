@@ -240,27 +240,60 @@ class TokenDiscovery:
         return top
 
     async def get_token_info(self, mint: str) -> Optional[TokenCandidate]:
-        """Fetch current on-chain data for a specific token mint."""
+        """
+        Fetch current price/data for a token. Tries two sources:
+        1. DexScreener — full market data (pairs, volume, liquidity)
+        2. Pump.fun API — bonding curve data for pre-graduation tokens
+        Returns None only if all sources fail.
+        """
         if not self._session:
             return None
+
+        # Source 1: DexScreener (covers graduated + most active tokens)
         try:
             url = self.DEXSCREENER_NEW_PAIRS.format(mint=mint)
-            async with self._session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                pairs = data.get("pairs", [])
-                if not pairs:
-                    return None
-                # Best pair = highest liquidity on Solana
-                sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-                if not sol_pairs:
-                    return None
-                pair = max(sol_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0)))
-                return self._parse_dexscreener_pair(pair)
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    sol_pairs = [
+                        p for p in (data.get("pairs") or [])
+                        if p.get("chainId") == "solana"
+                    ]
+                    if sol_pairs:
+                        pair = max(sol_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0)))
+                        candidate = self._parse_dexscreener_pair(pair)
+                        if candidate and candidate.price_usd > 0:
+                            return candidate
         except Exception as e:
-            logger.debug(f"get_token_info error for {mint}: {e}")
-            return None
+            logger.debug(f"get_token_info DexScreener {mint[:8]}: {e}")
+
+        # Source 2: Pump.fun bonding curve (pre-graduation tokens)
+        try:
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    d = await resp.json()
+                    mc = float(d.get("usd_market_cap", 0))
+                    # pump.fun fixed total supply = 1 billion tokens (6 decimals)
+                    total_supply = 1_000_000_000
+                    price_usd = mc / total_supply if mc > 0 else 0
+                    if price_usd > 0:
+                        logger.debug(f"pump.fun price {mint[:8]}: ${price_usd:.10f} (MC=${mc:,.0f})")
+                        return TokenCandidate(
+                            mint=mint,
+                            symbol=d.get("symbol", "???"),
+                            name=d.get("name", ""),
+                            price_usd=price_usd,
+                            market_cap_usd=mc,
+                            volume_24h_usd=0.0,
+                            liquidity_usd=0.0,
+                            age_hours=0.0,
+                            source="pump_fun",
+                        )
+        except Exception as e:
+            logger.debug(f"get_token_info pump.fun {mint[:8]}: {e}")
+
+        return None
 
     # ── Data fetchers ─────────────────────────────────────────────────────────
 

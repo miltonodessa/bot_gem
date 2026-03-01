@@ -111,6 +111,29 @@ class JupiterClient:
             await self._refresh_sol_price()
         return self._sol_price_cache
 
+    async def get_token_price_usd(self, mint: str) -> float:
+        """
+        Fetch real-time USD price for any token via Jupiter Price API v2.
+        Works for all tokens with Jupiter-accessible liquidity, including
+        pump.fun tokens (both bonding-curve and graduated).
+        Returns 0.0 if the token has no Jupiter price data yet.
+        """
+        if not self._session:
+            return 0.0
+        try:
+            url = f"https://api.jup.ag/price/v2?ids={mint}"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price_str = (data.get("data") or {}).get(mint, {}).get("price", "0")
+                    price = float(price_str or 0)
+                    if price > 0:
+                        logger.debug(f"Jupiter price {mint[:8]}: ${price:.8f}")
+                        return price
+        except Exception as e:
+            logger.debug(f"Jupiter price {mint[:8]}: {e}")
+        return 0.0
+
     async def usd_to_lamports(self, usd_amount: float) -> int:
         """Convert dollar amount to SOL lamports."""
         sol_price = await self.get_sol_price()
