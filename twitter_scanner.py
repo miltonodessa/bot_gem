@@ -30,7 +30,7 @@ from typing import Optional
 import aiohttp
 from loguru import logger
 
-from config import config, OG_SOLANA_MEMES, VIRAL_SEED_ACCOUNTS
+from config import config, VIRAL_SEED_ACCOUNTS
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -55,21 +55,6 @@ class ViralEvent:
 
 
 @dataclass
-class OGMemeSignal:
-    """Revival signal for an established Solana OG meme."""
-    symbol: str
-    mint: str
-    twitter_mentions_1h: int
-    volume_spike_pct: float       # % increase vs 1h ago
-    price_change_1h_pct: float
-    signal_strength: float        # 0–1
-
-    @property
-    def is_strong(self) -> bool:
-        return self.signal_strength >= 0.6
-
-
-@dataclass
 class NarrativeScore:
     category: str
     score: float
@@ -88,22 +73,25 @@ class NarrativeReport:
     """
     Dynamic narrative report — driven by what's actually viral today.
 
-    dominant_narrative: e.g. "ISRAEL_WAR", "ELON_MARS", "OG_MEME_REVIVAL"
+    dominant_narrative: e.g. "ISRAEL_WAR", "ELON_MARS", "TRUMP_TARIFFS"
     viral_events:       ranked list of viral stories with meme derivatives
-    og_signals:         OG meme coins showing revival signals
     meme_keywords:      flat list of all meme-worthy keywords (coin name candidates)
     trending_tokens:    $TICKER symbols explicitly mentioned on Twitter
     trending_mints:     resolved Solana mints (if detected)
     raw_keywords:       all keywords sorted by engagement weight
+
+    Note: og_signals is populated later by TokenDiscovery, not here.
+    Twitter scanner only answers "what is viral?" — not "which tokens are pumping?".
     """
     dominant_narrative: str
     viral_events: list[ViralEvent]
-    og_signals: list[OGMemeSignal]
     narratives: list[NarrativeScore]    # kept for compatibility with bot.py
     meme_keywords: list[str]
     trending_tokens: list[str]
     trending_mints: list[str]
     raw_keywords: list[str]
+    # Populated by TokenDiscovery after scanning — not by twitter scanner
+    og_signals: list = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def top_keywords(self, n: int = 20) -> list[str]:
@@ -112,9 +100,6 @@ class NarrativeReport:
     def is_valid_hour_to_trade(self, optimal_hours: list, avoid_hours: list) -> bool:
         current_hour = datetime.now(timezone.utc).hour
         return current_hour not in avoid_hours and current_hour in optimal_hours
-
-    def has_og_revival(self) -> bool:
-        return any(s.is_strong for s in self.og_signals)
 
     def __repr__(self) -> str:
         events = " | ".join(e.topic for e in self.viral_events[:3])
@@ -211,13 +196,7 @@ class TwitterNarrativeScanner:
         if sym_l.upper() in [t.upper() for t in narrative.trending_tokens]:
             score += 0.40
 
-        # 3. OG meme revival — if this token IS an OG meme and there's a revival signal
-        for sig in narrative.og_signals:
-            if sig.symbol.lower() == sym_l and sig.is_strong:
-                score += 0.35
-                break
-
-        # 4. Any match in raw keywords (weaker signal)
+        # 3. Any match in raw keywords (weaker signal)
         if score < 0.15:
             for kw in raw_kws[:60]:
                 if len(kw) >= 3 and (kw in name_l or kw in sym_l):
@@ -229,26 +208,23 @@ class TwitterNarrativeScanner:
     # ── Internal orchestration ────────────────────────────────────────────────
 
     async def _build_narrative(self) -> NarrativeReport:
-        """Orchestrate all data sources and build the report."""
-        viral_events: list[ViralEvent] = []
-        og_signals: list[OGMemeSignal] = []
+        """Orchestrate all data sources and build the report.
+
+        Twitter scanner is purely responsible for:
+          - Fetching viral/high-engagement tweets
+          - Clustering them into events ("story of the day")
+          - Extracting meme-name derivatives per event
+
+        It does NOT check token prices or on-chain data.
+        OG narrative token detection is done later by TokenDiscovery.
+        """
         trending_tokens: list[str] = []
 
-        # Fetch viral tweets and OG meme data concurrently
-        viral_task = asyncio.create_task(self._fetch_viral_tweets())
-        og_task = asyncio.create_task(self._check_og_meme_signals())
-
         try:
-            raw_viral = await viral_task
+            raw_viral = await self._fetch_viral_tweets()
         except Exception as e:
             logger.warning(f"Viral tweet fetch failed: {e}")
             raw_viral = []
-
-        try:
-            og_signals = await og_task
-        except Exception as e:
-            logger.warning(f"OG meme check failed: {e}")
-            og_signals = []
 
         # Cluster raw viral tweets into events
         viral_events = self._cluster_into_events(raw_viral)
@@ -297,12 +273,12 @@ class TwitterNarrativeScanner:
         return NarrativeReport(
             dominant_narrative=dominant,
             viral_events=viral_events,
-            og_signals=og_signals,
             narratives=compat_scores,
             meme_keywords=unique_kws,
             trending_tokens=trending_tokens,
             trending_mints=[],
             raw_keywords=unique_kws,
+            # og_signals left empty here — populated by TokenDiscovery
         )
 
     # ── Viral tweet fetching ──────────────────────────────────────────────────
@@ -462,75 +438,6 @@ class TwitterNarrativeScanner:
 
         logger.debug(f"Trending sources fallback: {len(tweet_texts)} items")
         return tweet_texts
-
-    # ── OG meme revival detection ─────────────────────────────────────────────
-
-    async def _check_og_meme_signals(self) -> list[OGMemeSignal]:
-        """
-        Check if established Solana OG memes are showing revival signals
-        (volume spike + Twitter mention increase).
-        """
-        if not self._session:
-            return []
-
-        signals: list[OGMemeSignal] = []
-
-        for symbol, mint in OG_SOLANA_MEMES.items():
-            try:
-                signal = await self._check_single_og_meme(symbol, mint)
-                if signal:
-                    signals.append(signal)
-            except Exception as e:
-                logger.debug(f"OG meme check failed for {symbol}: {e}")
-
-        # Sort by signal strength
-        signals.sort(key=lambda s: s.signal_strength, reverse=True)
-        strong = [s for s in signals if s.is_strong]
-        if strong:
-            logger.info(f"OG meme revival signals: {[s.symbol for s in strong]}")
-
-        return signals
-
-    async def _check_single_og_meme(self, symbol: str, mint: str) -> Optional[OGMemeSignal]:
-        """Fetch DexScreener data to detect volume/price spike for one OG meme."""
-        if not self._session:
-            return None
-
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            pairs = data.get("pairs") or []
-            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-            if not sol_pairs:
-                return None
-
-            # Pick pair with most liquidity
-            pair = max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0)))
-
-            price_change_1h = float((pair.get("priceChange") or {}).get("h1", 0))
-            vol_h1 = float((pair.get("volume") or {}).get("h1", 0))
-            vol_h24 = float((pair.get("volume") or {}).get("h24", 0))
-
-            # Volume spike: h1 volume is unusually high vs daily average
-            avg_hourly_vol = vol_h24 / 24 if vol_h24 > 0 else 1
-            vol_spike_pct = ((vol_h1 - avg_hourly_vol) / avg_hourly_vol * 100) if avg_hourly_vol > 0 else 0
-
-            # Signal strength formula
-            # Price up >15% in 1h OR volume spike >3x normal → strong signal
-            price_component = min(max(price_change_1h, 0) / 30, 1.0)   # 30% = max
-            vol_component = min(max(vol_spike_pct, 0) / 300, 1.0)       # 300% = max
-            strength = price_component * 0.5 + vol_component * 0.5
-
-            return OGMemeSignal(
-                symbol=symbol,
-                mint=mint,
-                twitter_mentions_1h=0,   # populated if Twitter API available
-                volume_spike_pct=vol_spike_pct,
-                price_change_1h_pct=price_change_1h,
-                signal_strength=strength,
-            )
 
     # ── Event clustering ──────────────────────────────────────────────────────
 

@@ -1,17 +1,25 @@
 """
 Token discovery module.
 
-Finds new Solana tokens on pump.fun / Raydium that match the current Twitter
-narrative and pass the market-cap / liquidity filters from wallet analysis:
+Finds Solana tokens matching the current viral narrative in two modes:
 
-  Golden Zone:  MC $5k – $20k   → 79% WR, best absolute PnL
-  Avoid zone:   MC $20k – $100k → 58% WR, net negative
-  Extended:     MC $100k – $500k → 60% WR (only with strong narrative conviction)
+  NEW tokens  — just launched on pump.fun / Raydium matching viral keywords
+                Golden Zone MC $5k–$20k (79% WR), age 2–1440 min
 
-Preferred routing: Jupiter → pump.fun pools (74% of winning trades).
+  NARRATIVE OG — existing tokens (age >6h) on the same narrative that are
+                 currently pumping (volume spike, price move up).
+                 "OG" here means: any token that was ALREADY on this topic
+                 before today's news hit — not a fixed list of famous memes.
+                 Examples: an "Israel" token from 2 months ago, a "Trump" token
+                 from last cycle. There are thousands of these across all topics.
+                 They get a relaxed MC filter (extended zone allowed).
+
+The OG detection replaces the old hardcoded OG_SOLANA_MEMES list.
+Every viral event potentially has its own "OG" tokens — we discover them live.
 """
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -21,6 +29,33 @@ from loguru import logger
 
 from config import config
 from twitter_scanner import NarrativeReport
+
+
+@dataclass
+class NarrativeOGSignal:
+    """
+    An existing token that is pumping in response to today's viral narrative.
+    NOT a fixed famous meme — any token matching the event keywords that
+    shows momentum (volume spike + price move).
+    """
+    symbol: str
+    mint: str
+    matched_keyword: str          # which viral keyword it matched
+    volume_spike_pct: float       # h1 vol vs hourly average (%)
+    price_change_1h_pct: float
+    age_hours: float              # how old is this token
+    signal_strength: float        # 0–1
+
+    @property
+    def is_strong(self) -> bool:
+        return self.signal_strength >= 0.55
+
+    def __repr__(self) -> str:
+        return (
+            f"NarrativeOG({self.symbol} | kw='{self.matched_keyword}' "
+            f"| +{self.price_change_1h_pct:.0f}% 1h | vol_spike={self.volume_spike_pct:.0f}% "
+            f"| age={self.age_hours:.0f}h | strength={self.signal_strength:.2f})"
+        )
 
 
 @dataclass
@@ -35,9 +70,11 @@ class TokenCandidate:
     age_minutes: float          # how old is the pool
     holder_count: int
     is_pump_fun: bool
-    source: str                 # "pump_fun" | "raydium" | "dexscreener"
+    source: str                 # "pump_fun" | "raydium" | "dexscreener" | "narrative_og"
     narrative_score: float = 0.0
     entry_score: float = 0.0    # final composite score
+    is_narrative_og: bool = False   # True = existing token pumping on this narrative
+    og_signal: Optional["NarrativeOGSignal"] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -106,25 +143,47 @@ class TokenDiscovery:
     ) -> list[TokenCandidate]:
         """
         Discover and rank token candidates against the current narrative.
+
+        Two parallel tracks:
+          1. NEW tokens — just launched, match narrative keywords
+          2. NARRATIVE OGs — existing tokens pumping on the same narrative
+
         Returns list sorted by entry_score descending.
         """
         logger.info(f"Discovering tokens for narrative: {narrative.dominant_narrative}")
 
-        # Gather from all sources concurrently
+        # Gather from all sources concurrently (new tokens + narrative OGs)
         results = await asyncio.gather(
             self._fetch_pump_fun_latest(),
             self._fetch_pump_fun_trending(),
             self._fetch_dexscreener_narrative(narrative),
             self._fetch_birdeye_trending(),
+            self._find_narrative_ogs(narrative),    # ← dynamic OG detection
             return_exceptions=True,
         )
 
         all_candidates: list[TokenCandidate] = []
+        og_signals: list[NarrativeOGSignal] = []
+
         for r in results:
             if isinstance(r, Exception):
                 logger.debug(f"Source error: {r}")
+            elif isinstance(r, tuple):
+                # _find_narrative_ogs returns (candidates, signals)
+                candidates, signals = r
+                all_candidates.extend(candidates)
+                og_signals.extend(signals)
             elif isinstance(r, list):
                 all_candidates.extend(r)
+
+        # Attach OG signals to narrative report so bot.py/risk can access them
+        narrative.og_signals = og_signals
+        if og_signals:
+            strong = [s for s in og_signals if s.is_strong]
+            logger.info(
+                f"Narrative OG signals: {len(og_signals)} found, "
+                f"{len(strong)} strong: {[s.symbol for s in strong]}"
+            )
 
         # Deduplicate by mint
         seen = set()
@@ -309,6 +368,182 @@ class TokenDiscovery:
             logger.debug(f"Birdeye trending error: {e}")
             return []
 
+    async def _find_narrative_ogs(
+        self, narrative: NarrativeReport
+    ) -> tuple[list[TokenCandidate], list[NarrativeOGSignal]]:
+        """
+        Dynamically discover EXISTING tokens that are pumping on today's narrative.
+
+        These are "narrative OGs": tokens that were created before today's news
+        but match the same keywords and are now moving. NOT a fixed list.
+
+        For example:
+          - "Israel" viral today → search DexScreener for tokens named ISRAEL,
+            IDF, BIBI, NETANYAHU, GAZA that are >6h old and are pumping
+          - "Trump tariffs" viral → find TRUMP, TARIFF, MAGA tokens with spikes
+          - Any topic: the market has thousands of existing themed tokens
+
+        Criteria for a "narrative OG":
+          age > 6h           (established, not brand new)
+          price_change_1h > 8%   OR   volume_spike > 200%
+          liquidity > $3k    (real market)
+          NOT in dead zone MC $20k–$100k
+
+        Returns (candidates_list, og_signals_list).
+        """
+        if not self._session:
+            return [], []
+
+        candidates: list[TokenCandidate] = []
+        signals: list[NarrativeOGSignal] = []
+
+        # Use the top meme derivatives from each viral event
+        og_keywords: list[tuple[str, str]] = []  # (keyword, source_event_topic)
+        for event in getattr(narrative, "viral_events", [])[:3]:
+            # Use only the most specific words (longer = more specific to this event)
+            specific_kws = sorted(event.meme_derivatives[:8], key=len, reverse=True)
+            for kw in specific_kws[:4]:
+                if len(kw) >= 3:
+                    og_keywords.append((kw, event.topic))
+
+        # Also add explicit $TICKER mentions from Twitter
+        for ticker in narrative.trending_tokens[:5]:
+            og_keywords.append((ticker, "twitter_ticker"))
+
+        # Deduplicate keywords
+        seen_kws: set[str] = set()
+        unique_kw_pairs = []
+        for kw, topic in og_keywords:
+            if kw.lower() not in seen_kws:
+                seen_kws.add(kw.lower())
+                unique_kw_pairs.append((kw, topic))
+
+        now_ts_ms = datetime.now(timezone.utc).timestamp() * 1000
+
+        for kw, source_topic in unique_kw_pairs[:10]:
+            try:
+                url = self.DEXSCREENER_SEARCH.format(query=kw)
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    pairs = data.get("pairs", []) or []
+
+                    for pair in pairs:
+                        if pair.get("chainId") != "solana":
+                            continue
+
+                        # ── Age check: must be >6h old to qualify as "OG" ──
+                        pair_created = pair.get("pairCreatedAt", 0) or 0
+                        age_minutes = (now_ts_ms - pair_created) / 60_000 if pair_created else 0
+                        age_hours = age_minutes / 60
+
+                        if age_hours < 6:
+                            continue   # too new = regular new launch, not OG
+
+                        # ── Parse basic token data ──
+                        base = pair.get("baseToken", {})
+                        mint = base.get("address", "")
+                        if not mint:
+                            continue
+
+                        price_change_1h = float((pair.get("priceChange") or {}).get("h1", 0))
+                        vol_h1 = float((pair.get("volume") or {}).get("h1", 0))
+                        vol_h6 = float((pair.get("volume") or {}).get("h6", 0))
+                        vol_h24 = float((pair.get("volume") or {}).get("h24", 0))
+                        liq = float((pair.get("liquidity") or {}).get("usd", 0))
+                        mc = float(pair.get("fdv", 0) or pair.get("marketCap", 0) or 0)
+
+                        if liq < config.min_liquidity_usd:
+                            continue
+
+                        # Skip dead zone MC ($20k–$100k) for OGs too
+                        if 20_000 < mc < 100_000:
+                            continue
+
+                        # ── Momentum check: is it actually pumping? ──
+                        # Compare last hour vs the 6h hourly average
+                        avg_hourly_vol = vol_h6 / 6 if vol_h6 > 0 else (vol_h24 / 24 if vol_h24 > 0 else 0)
+                        if avg_hourly_vol > 0:
+                            vol_spike_pct = (vol_h1 - avg_hourly_vol) / avg_hourly_vol * 100
+                        else:
+                            vol_spike_pct = 0.0
+
+                        # Must show at least one of: price move OR volume spike
+                        has_momentum = (
+                            price_change_1h >= 8.0       # price up 8%+ in 1h
+                            or vol_spike_pct >= 200.0    # volume 3x+ hourly avg
+                        )
+                        if not has_momentum:
+                            continue
+
+                        # ── Compute signal strength ──
+                        price_component = min(max(price_change_1h, 0) / 40, 1.0)  # 40% = full
+                        vol_component = min(max(vol_spike_pct, 0) / 400, 1.0)     # 400% = full
+                        strength = price_component * 0.55 + vol_component * 0.45
+
+                        signal = NarrativeOGSignal(
+                            symbol=base.get("symbol", ""),
+                            mint=mint,
+                            matched_keyword=kw,
+                            volume_spike_pct=vol_spike_pct,
+                            price_change_1h_pct=price_change_1h,
+                            age_hours=age_hours,
+                            signal_strength=strength,
+                        )
+                        signals.append(signal)
+                        logger.debug(f"Narrative OG found: {signal}")
+
+                        # Build TokenCandidate for this OG token
+                        price_usd = float(pair.get("priceUsd", 0) or 0)
+                        is_pump = "pump" in (pair.get("dexId", "") + pair.get("url", "")).lower()
+
+                        c = TokenCandidate(
+                            mint=mint,
+                            symbol=base.get("symbol", ""),
+                            name=base.get("name", ""),
+                            market_cap_usd=mc,
+                            liquidity_usd=liq,
+                            price_usd=price_usd,
+                            volume_24h=vol_h24,
+                            age_minutes=age_minutes,
+                            holder_count=0,
+                            is_pump_fun=is_pump,
+                            source="narrative_og",
+                            is_narrative_og=True,
+                            og_signal=signal,
+                        )
+                        candidates.append(c)
+
+                await asyncio.sleep(0.25)
+
+            except Exception as e:
+                logger.debug(f"Narrative OG search error for '{kw}': {e}")
+
+        # Deduplicate by mint
+        seen_mints: set[str] = set()
+        unique_candidates = []
+        unique_signals = []
+        seen_sig_mints: set[str] = set()
+
+        for c in candidates:
+            if c.mint not in seen_mints:
+                seen_mints.add(c.mint)
+                unique_candidates.append(c)
+
+        for s in signals:
+            if s.mint not in seen_sig_mints:
+                seen_sig_mints.add(s.mint)
+                unique_signals.append(s)
+
+        # Sort signals by strength
+        unique_signals.sort(key=lambda s: s.signal_strength, reverse=True)
+
+        if unique_candidates:
+            logger.info(f"Narrative OGs discovered: {len(unique_candidates)} tokens pumping on '{narrative.dominant_narrative}'")
+
+        return unique_candidates, unique_signals
+
     # ── Parsers ───────────────────────────────────────────────────────────────
 
     def _parse_pump_fun_coin(self, coin: dict) -> Optional[TokenCandidate]:
@@ -414,22 +649,31 @@ class TokenDiscovery:
     # ── Scoring / filtering ───────────────────────────────────────────────────
 
     def _passes_hard_filters(self, c: TokenCandidate) -> bool:
-        """Hard filters based on wallet analysis golden rules."""
-        # Must be in golden zone or extended zone (not $20k-$100k dead zone)
-        in_golden = c.in_golden_zone
-        in_extended = c.in_extended_zone
-        if not in_golden and not in_extended:
-            return False
+        """
+        Hard filters — two different paths for new tokens vs narrative OGs.
 
-        # Avoid the dead zone $20k–$100k (58% WR, net negative in analysis)
-        if 20_000 < c.market_cap_usd < 100_000:
-            return False
-
-        # Minimum liquidity
+        NEW tokens: strict age + MC golden zone
+        NARRATIVE OGs: already pre-filtered in _find_narrative_ogs (momentum
+                       check is their entry gate), so they only need MC check here.
+        """
+        # Minimum liquidity always required
         if not c.passes_liquidity:
             return False
 
-        # Reject tokens < 2 min old (rug risk) or > 24h (missed move)
+        # Avoid the dead zone $20k–$100k for both paths (58% WR, net negative)
+        if 20_000 < c.market_cap_usd < 100_000:
+            return False
+
+        if c.is_narrative_og:
+            # OGs already checked age (>6h) and momentum inside _find_narrative_ogs
+            # Here we just verify MC: golden or extended zone
+            return c.in_golden_zone or c.in_extended_zone
+
+        # NEW tokens: must be in golden zone or extended, and right age window
+        if not c.in_golden_zone and not c.in_extended_zone:
+            return False
+
+        # Reject tokens < 2 min (rug risk) or > 24h for new launches
         if c.age_minutes < 2 or c.age_minutes > 1440:
             return False
 
@@ -441,23 +685,29 @@ class TokenDiscovery:
         """
         Composite entry score 0.0–1.0.
 
-        Weights:
-          - Narrative alignment (dynamic viral event match): 40%
-          - Market cap position within golden zone:          25%
-          - Liquidity quality:                               15%
-          - Age sweetspot (5-60 min):                        10%
-          - Pump.fun routing bonus:                          10%
+        NEW token weights:
+          - Narrative alignment:           40%
+          - Market cap in golden zone:     25%
+          - Liquidity quality:             15%
+          - Age sweetspot (5-60 min):      10%
+          - Pump.fun routing bonus:        10%
 
-        Bonuses:
-          - Token name matches a HIGH-engagement viral event: +0.15
-          - OG meme revival signal active for this token:     +0.10
+        NARRATIVE OG weights (existing pumping token):
+          - Signal strength from OG check: 45%
+          - Narrative keyword match:       35%
+          - Market cap (extended ok):      20%
+          (Age/pump bonus not relevant for established tokens)
         """
+        if c.is_narrative_og and c.og_signal:
+            return self._score_narrative_og(c)
+
+        # ── New token scoring ──────────────────────────────────────────────
         score = 0.0
 
         # 1. Narrative alignment (40%)
         score += c.narrative_score * 0.40
 
-        # 1b. Bonus: matches top viral event (score >= 0.7)
+        # Bonus: matches top viral event
         top_events = getattr(narrative, "viral_events", [])
         if top_events and top_events[0].engagement_score >= 0.7:
             name_l = c.name.lower()
@@ -466,13 +716,6 @@ class TokenDiscovery:
                 if kw in name_l or kw in sym_l or name_l in kw or sym_l in kw:
                     score += 0.15
                     break
-
-        # 1c. Bonus: OG meme revival and this IS that OG meme
-        og_signals = getattr(narrative, "og_signals", [])
-        for sig in og_signals:
-            if sig.is_strong and sig.symbol.lower() == c.symbol.lower():
-                score += 0.10
-                break
 
         # 2. Market cap score (25%)
         if c.in_golden_zone:
@@ -495,5 +738,33 @@ class TokenDiscovery:
         # 5. pump.fun routing bonus (10%)
         if c.is_pump_fun:
             score += 0.10
+
+        return min(score, 1.0)
+
+    def _score_narrative_og(self, c: TokenCandidate) -> float:
+        """
+        Score for a narrative OG token (existing token pumping on today's narrative).
+
+        Primary driver is momentum signal strength, secondary is narrative match.
+        MC scoring is more lenient — OGs often have higher caps.
+        """
+        score = 0.0
+        sig = c.og_signal
+
+        # 1. Momentum signal strength (45%)
+        score += sig.signal_strength * 0.45
+
+        # 2. Narrative keyword match (35%)
+        score += c.narrative_score * 0.35
+
+        # 3. Market cap (20%) — golden zone best, extended ok
+        if c.in_golden_zone:
+            mc_norm = 1.0 - (c.market_cap_usd - config.min_market_cap) / (
+                config.max_market_cap - config.min_market_cap
+            )
+            score += max(mc_norm, 0) * 0.20
+        elif c.in_extended_zone:
+            # Still valuable if momentum is real
+            score += 0.12
 
         return min(score, 1.0)

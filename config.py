@@ -74,25 +74,6 @@ class TradingConfig:
     min_liquidity_usd: float = 3000.0
 
 
-# ── OG Solana memes (mint addresses) ─────────────────────────────────────────
-# Tracked for revival signals: volume/price spike = OG meme season starting.
-# When these pump → related new coins on pump.fun often follow.
-OG_SOLANA_MEMES: dict[str, str] = {
-    "BONK":   "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-    "WIF":    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-    "POPCAT": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
-    "MEW":    "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
-    "BRETT":  "BRETTQszPe4F7GnMBFAGHMQNr9JMoqMaA8HNnRzsTroy",
-    "BOME":   "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82",
-    "MYRO":   "HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4",
-    "PONKE":  "5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK31CR6ZDN",
-    "SLERF":  "7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7ByyfkZ1",
-    "GIGA":   "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9",
-    "MOODENG":"ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzc8yy",
-    "PNUT":   "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump",
-    "GOAT":   "CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump",
-}
-
 # ── Viral seed accounts (for narrative scanning) ──────────────────────────────
 # Mix of: Solana alpha callers, viral meme accounts, news accounts, crypto influencers
 VIRAL_SEED_ACCOUNTS = [
