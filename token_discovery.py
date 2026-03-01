@@ -111,7 +111,9 @@ class TokenDiscovery:
 
     DEXSCREENER_NEW_PAIRS = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
     DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={query}"
-    DEXSCREENER_LATEST_SOLANA = "https://api.dexscreener.com/latest/dex/pairs/solana"
+    # /latest/dex/pairs/solana is deprecated → use token-profiles endpoint
+    DEXSCREENER_TOKEN_PROFILES = "https://api.dexscreener.com/token-profiles/latest/v1"
+    DEXSCREENER_LATEST_SOLANA = "https://api.dexscreener.com/token-profiles/latest/v1"
     # pump.fun API — try multiple known endpoints (API changes frequently)
     PUMP_FUN_URLS = [
         "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
@@ -304,28 +306,72 @@ class TokenDiscovery:
 
     async def _fetch_dexscreener_latest_solana(self) -> list[TokenCandidate]:
         """
-        Fetch the latest pairs on Solana directly from DexScreener.
-        This is the most reliable source — no keywords, no API key, always works.
-        Returns the 50 most recently updated Solana pairs.
+        Fetch latest Solana token profiles from DexScreener.
+        Uses /token-profiles/latest/v1 — stable endpoint, no API key needed.
+        Falls back to searching for common pump.fun terms if profiles fail.
         """
         if not self._session:
             return []
+
+        # Try token-profiles endpoint first
         try:
             async with self._session.get(
-                self.DEXSCREENER_LATEST_SOLANA,
+                self.DEXSCREENER_TOKEN_PROFILES,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                if resp.status != 200:
-                    logger.warning(f"DexScreener latest Solana HTTP {resp.status}")
-                    return []
-                data = await resp.json()
-                pairs = data.get("pairs") or []
-                candidates = [c for p in pairs if (c := self._parse_dexscreener_pair(p))]
-                logger.info(f"DexScreener latest Solana: {len(candidates)} pairs fetched")
-                return candidates
+                if resp.status == 200:
+                    profiles = await resp.json()
+                    if isinstance(profiles, list):
+                        # Filter Solana profiles and fetch their pair data
+                        sol_mints = [
+                            p["tokenAddress"] for p in profiles
+                            if p.get("chainId") == "solana" and p.get("tokenAddress")
+                        ][:20]
+                        if sol_mints:
+                            candidates = await self._fetch_pairs_for_mints(sol_mints)
+                            logger.info(f"DexScreener token-profiles: {len(candidates)} Solana tokens")
+                            return candidates
+                else:
+                    logger.warning(f"DexScreener token-profiles HTTP {resp.status}")
         except Exception as e:
-            logger.warning(f"DexScreener latest Solana error: {e}")
+            logger.warning(f"DexScreener token-profiles error: {e}")
+
+        # Fallback: search broad pump.fun query
+        try:
+            url = self.DEXSCREENER_SEARCH.format(query="pump")
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
+                    candidates = [c for p in pairs if (c := self._parse_dexscreener_pair(p))]
+                    logger.info(f"DexScreener fallback search: {len(candidates)} Solana pairs")
+                    return candidates
+        except Exception as e:
+            logger.warning(f"DexScreener fallback search error: {e}")
+
+        return []
+
+    async def _fetch_pairs_for_mints(self, mints: list[str]) -> list[TokenCandidate]:
+        """Batch-fetch pair data for a list of mint addresses."""
+        if not self._session:
             return []
+        candidates = []
+        # DexScreener allows comma-separated addresses (up to 30)
+        chunk = ",".join(mints[:30])
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{chunk}"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for pair in (data.get("pairs") or []):
+                        if pair.get("chainId") != "solana":
+                            continue
+                        c = self._parse_dexscreener_pair(pair)
+                        if c:
+                            candidates.append(c)
+        except Exception as e:
+            logger.warning(f"DexScreener batch mint fetch error: {e}")
+        return candidates
 
     async def _fetch_dexscreener_narrative(
         self, narrative: NarrativeReport

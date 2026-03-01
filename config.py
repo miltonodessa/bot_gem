@@ -17,8 +17,9 @@ class TradingConfig:
     backup_rpc_url: str = os.getenv("BACKUP_RPC_URL", "")
 
     # ── Jupiter ───────────────────────────────────────────────────────────────
-    jupiter_api_url: str = os.getenv("JUPITER_API_URL", "https://quote-api.jup.ag/v6")
-    jupiter_price_api: str = os.getenv("JUPITER_PRICE_API", "https://price.jup.ag/v4")
+    # Jupiter migrated from quote-api.jup.ag → api.jup.ag
+    jupiter_api_url: str = os.getenv("JUPITER_API_URL", "https://api.jup.ag/v6")
+    jupiter_price_api: str = os.getenv("JUPITER_PRICE_API", "https://api.jup.ag/v6")
 
     # ── Twitter / X ───────────────────────────────────────────────────────────
     twitter_bearer_token: str = os.getenv("TWITTER_BEARER_TOKEN", "")

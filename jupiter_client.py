@@ -157,8 +157,14 @@ class JupiterClient:
     ) -> SwapResult:
         """
         Execute a buy swap SOL → token.
-        In DRY_RUN mode logs the intended trade without sending.
+        In DRY_RUN mode returns simulated result — no Jupiter calls made.
         """
+        if config.dry_run:
+            sol_price = await self.get_sol_price()
+            sim_lamports = int(usd_amount / sol_price * 1e9)
+            logger.info(f"[DRY RUN] BUY {token_mint[:8]}... ${usd_amount:.0f} ({sim_lamports} lamports)")
+            return SwapResult(True, "DRY_RUN_SIG", sim_lamports, sim_lamports * 1000, 0.0)
+
         quote = await self.quote_buy(token_mint, usd_amount, prefer_pump)
         if not quote:
             return SwapResult(False, None, 0, 0, 0, "Failed to get quote")
@@ -169,10 +175,6 @@ class JupiterClient:
                 f"Price impact too high: {quote.price_impact_pct:.1f}%"
             )
 
-        if config.dry_run:
-            logger.info(f"[DRY RUN] BUY {token_mint[:8]}... {quote}")
-            return SwapResult(True, "DRY_RUN_SIG", quote.in_amount, quote.out_amount, 0.0)
-
         return await self._execute_swap(quote)
 
     async def execute_sell(
@@ -181,7 +183,11 @@ class JupiterClient:
         token_amount: int,
         prefer_pump: bool = True,
     ) -> SwapResult:
-        """Execute a sell swap token → SOL."""
+        """Execute a sell swap token → SOL. In DRY_RUN skips Jupiter entirely."""
+        if config.dry_run:
+            logger.info(f"[DRY RUN] SELL {token_mint[:8]}... {token_amount} tokens")
+            return SwapResult(True, "DRY_RUN_SIG", token_amount, token_amount // 1000, 0.0)
+
         quote = await self.quote_sell(token_mint, token_amount, prefer_pump)
         if not quote:
             return SwapResult(False, None, 0, 0, 0, "Failed to get sell quote")
@@ -361,19 +367,34 @@ class JupiterClient:
         return False
 
     async def _refresh_sol_price(self):
-        """Fetch SOL/USD from Jupiter price API."""
+        """Fetch SOL/USD price. Tries Jupiter v6, then CoinGecko as fallback."""
         if not self._session:
             return
+        # Jupiter v6 price endpoint
         try:
-            url = f"{config.jupiter_price_api}/price?ids={config.sol_mint}"
-            async with self._session.get(url) as resp:
+            url = f"https://api.jup.ag/price/v2?ids={config.sol_mint}"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    price_data = data.get("data", {}).get(config.sol_mint, {})
-                    price = float(price_data.get("price", 0))
+                    price = float((data.get("data") or {}).get(config.sol_mint, {}).get("price", 0))
                     if price > 0:
                         self._sol_price_cache = price
                         self._sol_price_ts = time.time()
-                        logger.debug(f"SOL price refreshed: ${price:.2f}")
+                        logger.debug(f"SOL price: ${price:.2f}")
+                        return
+        except Exception:
+            pass
+        # CoinGecko fallback (no key needed)
+        try:
+            url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price = float(data.get("solana", {}).get("usd", 0))
+                    if price > 0:
+                        self._sol_price_cache = price
+                        self._sol_price_ts = time.time()
+                        logger.debug(f"SOL price (CoinGecko): ${price:.2f}")
+                        return
         except Exception as e:
             logger.debug(f"SOL price refresh failed: {e}")
