@@ -97,10 +97,6 @@ class NarrativeReport:
     def top_keywords(self, n: int = 20) -> list[str]:
         return self.meme_keywords[:n]
 
-    def is_valid_hour_to_trade(self, optimal_hours: list, avoid_hours: list) -> bool:
-        current_hour = datetime.now(timezone.utc).hour
-        return current_hour not in avoid_hours and current_hour in optimal_hours
-
     def __repr__(self) -> str:
         events = " | ".join(e.topic for e in self.viral_events[:3])
         return f"NarrativeReport('{self.dominant_narrative}' | events=[{events}])"

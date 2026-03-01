@@ -58,11 +58,6 @@ class TradingConfig:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     narrative_refresh_minutes: int = int(os.getenv("NARRATIVE_REFRESH_MINUTES", "60"))
 
-    # ── Optimal trading hours UTC (from wallet analysis) ─────────────────────
-    # Best: 4h, 13h, 14h, 15h UTC  |  Worst: 6h, 8h, 12h, 22h UTC
-    optimal_hours_utc: list = field(default_factory=lambda: [4, 13, 14, 15, 16, 17])
-    avoid_hours_utc: list = field(default_factory=lambda: [6, 8, 12, 22, 23])
-
     # ── Token constants ───────────────────────────────────────────────────────
     sol_mint: str = "So11111111111111111111111111111111111111112"
     usdc_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"

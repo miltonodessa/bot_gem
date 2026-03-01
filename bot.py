@@ -180,12 +180,6 @@ class NarrativeTradingBot:
         if not self._narrative:
             return
 
-        # Don't trade in bad hours
-        current_hour = datetime.now(timezone.utc).hour
-        if current_hour in config.avoid_hours_utc:
-            logger.debug(f"Skipping scan — bad hour UTC {current_hour}")
-            return
-
         candidates = await discovery.discover(
             narrative=self._narrative,
             narrative_scanner=twitter,
@@ -365,8 +359,7 @@ class NarrativeTradingBot:
                 f"Golden Zone: ${config.min_market_cap:,.0f} – ${config.max_market_cap:,.0f} MC\n"
                 f"Position: ${config.trade_amount_sol * 150:.0f} per trade\n"
                 f"Stop Loss: {config.stop_loss_pct}% | TP: {config.take_profit_pct}%\n"
-                f"Max Hold: {config.max_hold_hours}h\n"
-                f"Optimal Hours UTC: {config.optimal_hours_utc}",
+                f"Max Hold: {config.max_hold_hours}h",
                 title="Startup",
             )
         )

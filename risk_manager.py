@@ -155,11 +155,6 @@ class RiskManager:
         if mint in self.open_positions:
             return False, "already_in_position"
 
-        # Optimal trading hours
-        current_hour = datetime.now(timezone.utc).hour
-        if current_hour in config.avoid_hours_utc:
-            return False, f"bad_hour_utc_{current_hour}"
-
         # Narrative score threshold
         if narrative_score < config.min_narrative_score:
             return False, f"narrative_score_too_low ({narrative_score:.2f})"
