@@ -240,11 +240,6 @@ class TwitterNarrativeScanner:
             meme_keywords.extend(event.meme_derivatives)
             meme_keywords.extend(event.raw_keywords)
 
-        # Add OG meme symbols if revival signals are strong
-        for sig in og_signals:
-            if sig.is_strong:
-                meme_keywords.insert(0, sig.symbol.lower())
-
         # Deduplicate preserving order
         seen: set[str] = set()
         unique_kws: list[str] = []
@@ -255,7 +250,7 @@ class TwitterNarrativeScanner:
                 unique_kws.append(kw_l)
 
         # Determine dominant narrative label
-        dominant = self._determine_dominant(viral_events, og_signals)
+        dominant = self._determine_dominant(viral_events)
 
         # Build compatibility NarrativeScore list
         compat_scores = [
@@ -579,22 +574,11 @@ class TwitterNarrativeScanner:
 
     # ── Dominant narrative ────────────────────────────────────────────────────
 
-    def _determine_dominant(
-        self, events: list[ViralEvent], og_signals: list[OGMemeSignal]
-    ) -> str:
+    def _determine_dominant(self, events: list[ViralEvent]) -> str:
         """Label the dominant narrative for logging / bot status display."""
-        strong_og = [s for s in og_signals if s.is_strong]
-
-        if strong_og and (not events or events[0].engagement_score < 0.5):
-            # OG meme revival dominates when no viral news event
-            symbols = "+".join(s.symbol for s in strong_og[:2])
-            return f"OG_REVIVAL_{symbols}"
-
         if events:
             topic = events[0].topic.upper().replace(" ", "_").replace("/", "_")
-            # Truncate for readability
             return topic[:30]
-
         return "UNKNOWN"
 
     # ── Fallback ──────────────────────────────────────────────────────────────
