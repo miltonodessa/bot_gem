@@ -187,7 +187,7 @@ class NarrativeTradingBot:
         )
 
         if not candidates:
-            logger.debug("No candidates found in this scan")
+            logger.info("No candidates passed filters in this scan")
             return
 
         # Evaluate top candidates for entry

@@ -155,10 +155,6 @@ class RiskManager:
         if mint in self.open_positions:
             return False, "already_in_position"
 
-        # Narrative score threshold
-        if narrative_score < config.min_narrative_score:
-            return False, f"narrative_score_too_low ({narrative_score:.2f})"
-
         return True, ""
 
     def register_entry(

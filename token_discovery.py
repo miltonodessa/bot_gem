@@ -111,10 +111,22 @@ class TokenDiscovery:
 
     DEXSCREENER_NEW_PAIRS = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
     DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={query}"
-    DEXSCREENER_NEW = "https://api.dexscreener.com/latest/dex/pairs/solana"
-    PUMP_FUN_LATEST = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false"
-    PUMP_FUN_TRENDING = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC"
+    DEXSCREENER_LATEST_SOLANA = "https://api.dexscreener.com/latest/dex/pairs/solana"
+    # pump.fun API — try multiple known endpoints (API changes frequently)
+    PUMP_FUN_URLS = [
+        "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
+        "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC",
+        "https://client-api-2.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC",
+    ]
+    PUMP_FUN_TRENDING_URLS = [
+        "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC",
+        "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC",
+    ]
     BIRDEYE_TRENDING = "https://public-api.birdeye.so/defi/trending_tokens?chain=solana&limit=50"
+
+    # Generic words from fallback event — useless as DexScreener search terms
+    _FALLBACK_SKIP_WORDS = {"sol", "meme", "doge", "pepe", "frog", "cat", "dog",
+                            "moon", "gem", "ape", "pump", "solana"}
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
@@ -156,18 +168,24 @@ class TokenDiscovery:
         results = await asyncio.gather(
             self._fetch_pump_fun_latest(),
             self._fetch_pump_fun_trending(),
+            self._fetch_dexscreener_latest_solana(),   # ← always works, no keywords needed
             self._fetch_dexscreener_narrative(narrative),
             self._fetch_birdeye_trending(),
-            self._find_narrative_ogs(narrative),    # ← dynamic OG detection
+            self._find_narrative_ogs(narrative),       # ← dynamic OG detection
             return_exceptions=True,
         )
 
+        source_names = [
+            "pump_fun_latest", "pump_fun_trending",
+            "dexscreener_latest", "dexscreener_narrative",
+            "birdeye", "narrative_ogs",
+        ]
         all_candidates: list[TokenCandidate] = []
         og_signals: list[NarrativeOGSignal] = []
 
-        for r in results:
+        for name, r in zip(source_names, results):
             if isinstance(r, Exception):
-                logger.debug(f"Source error: {r}")
+                logger.warning(f"Source [{name}] error: {r}")
             elif isinstance(r, tuple):
                 # _find_narrative_ogs returns (candidates, signals)
                 candidates, signals = r
@@ -242,43 +260,68 @@ class TokenDiscovery:
     # ── Data fetchers ─────────────────────────────────────────────────────────
 
     async def _fetch_pump_fun_latest(self) -> list[TokenCandidate]:
-        """Fetch the newest tokens from pump.fun."""
+        """Fetch the newest tokens from pump.fun, trying multiple API endpoints."""
         if not self._session:
             return []
-        try:
-            async with self._session.get(self.PUMP_FUN_LATEST) as resp:
-                if resp.status != 200:
-                    return []
-                coins = await resp.json()
-                candidates = []
-                for coin in coins:
-                    c = self._parse_pump_fun_coin(coin)
-                    if c:
-                        candidates.append(c)
-                logger.debug(f"pump.fun latest: {len(candidates)} tokens fetched")
-                return candidates
-        except Exception as e:
-            logger.debug(f"pump.fun latest error: {e}")
-            return []
+        for url in self.PUMP_FUN_URLS:
+            try:
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"pump.fun latest HTTP {resp.status} at {url}")
+                        continue
+                    coins = await resp.json()
+                    if not isinstance(coins, list) or not coins:
+                        continue
+                    candidates = [c for coin in coins if (c := self._parse_pump_fun_coin(coin))]
+                    logger.info(f"pump.fun latest: {len(candidates)} tokens from {url}")
+                    return candidates
+            except Exception as e:
+                logger.warning(f"pump.fun latest error ({url}): {e}")
+        return []
 
     async def _fetch_pump_fun_trending(self) -> list[TokenCandidate]:
         """Fetch currently most-traded tokens on pump.fun."""
         if not self._session:
             return []
+        for url in self.PUMP_FUN_TRENDING_URLS:
+            try:
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"pump.fun trending HTTP {resp.status} at {url}")
+                        continue
+                    coins = await resp.json()
+                    if not isinstance(coins, list) or not coins:
+                        continue
+                    candidates = [c for coin in coins if (c := self._parse_pump_fun_coin(coin))]
+                    logger.info(f"pump.fun trending: {len(candidates)} tokens")
+                    return candidates
+            except Exception as e:
+                logger.warning(f"pump.fun trending error ({url}): {e}")
+        return []
+
+    async def _fetch_dexscreener_latest_solana(self) -> list[TokenCandidate]:
+        """
+        Fetch the latest pairs on Solana directly from DexScreener.
+        This is the most reliable source — no keywords, no API key, always works.
+        Returns the 50 most recently updated Solana pairs.
+        """
+        if not self._session:
+            return []
         try:
-            async with self._session.get(self.PUMP_FUN_TRENDING) as resp:
+            async with self._session.get(
+                self.DEXSCREENER_LATEST_SOLANA,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
                 if resp.status != 200:
+                    logger.warning(f"DexScreener latest Solana HTTP {resp.status}")
                     return []
-                coins = await resp.json()
-                candidates = []
-                for coin in coins:
-                    c = self._parse_pump_fun_coin(coin)
-                    if c:
-                        candidates.append(c)
-                logger.debug(f"pump.fun trending: {len(candidates)} tokens fetched")
+                data = await resp.json()
+                pairs = data.get("pairs") or []
+                candidates = [c for p in pairs if (c := self._parse_dexscreener_pair(p))]
+                logger.info(f"DexScreener latest Solana: {len(candidates)} pairs fetched")
                 return candidates
         except Exception as e:
-            logger.debug(f"pump.fun trending error: {e}")
+            logger.warning(f"DexScreener latest Solana error: {e}")
             return []
 
     async def _fetch_dexscreener_narrative(
@@ -325,25 +368,37 @@ class TokenDiscovery:
                 seen.add(t)
                 unique_terms.append(t)
 
-        for kw in unique_terms[:10]:
+        # Skip generic fallback words — they produce irrelevant results
+        useful_terms = [t for t in unique_terms if t not in self._FALLBACK_SKIP_WORDS and len(t) >= 3]
+
+        if not useful_terms:
+            logger.info("DexScreener narrative search: no specific keywords (fallback mode), skipping")
+            return []
+
+        for kw in useful_terms[:10]:
             try:
                 url = self.DEXSCREENER_SEARCH.format(query=kw)
-                async with self._session.get(url) as resp:
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     if resp.status != 200:
+                        logger.warning(f"DexScreener search HTTP {resp.status} for '{kw}'")
                         continue
                     data = await resp.json()
                     pairs = data.get("pairs", []) or []
+                    added = 0
                     for pair in pairs:
                         if pair.get("chainId") != "solana":
                             continue
                         c = self._parse_dexscreener_pair(pair)
                         if c:
                             candidates.append(c)
+                            added += 1
+                    if added:
+                        logger.info(f"DexScreener search '{kw}': {added} Solana pairs")
                 await asyncio.sleep(0.2)
             except Exception as e:
-                logger.debug(f"DexScreener search error for '{kw}': {e}")
+                logger.warning(f"DexScreener search error for '{kw}': {e}")
 
-        logger.debug(f"DexScreener narrative search ({len(unique_terms)} terms): {len(candidates)} candidates")
+        logger.info(f"DexScreener narrative search total: {len(candidates)} candidates")
         return candidates
 
     async def _fetch_birdeye_trending(self) -> list[TokenCandidate]:
