@@ -191,6 +191,15 @@ class NarrativeTradingBot:
             logger.info("No candidates passed filters in this scan")
             return
 
+        # Log full candidate list with contract addresses
+        logger.info(f"── Top {min(len(candidates), 5)} candidates ──")
+        for c in candidates[:5]:
+            url = c.dexscreener_url() if not c.is_pump_fun else c.pumpfun_url()
+            logger.info(
+                f"  {c.symbol:8s} MC=${c.market_cap_usd:>9,.0f} "
+                f"score={c.entry_score:.2f} | {c.mint} | {url}"
+            )
+
         # Evaluate top candidates for entry
         sol_price = await jupiter.get_sol_price()
 
@@ -200,7 +209,9 @@ class NarrativeTradingBot:
                 narrative_score=candidate.narrative_score,
             )
             if not can_enter:
-                logger.info(f"Entry blocked [{candidate.symbol}]: {reason}")
+                logger.info(
+                    f"Entry blocked [{candidate.symbol}] {candidate.mint}: {reason}"
+                )
                 continue
 
             logger.info(f"Entering: {candidate}")
@@ -219,11 +230,14 @@ class NarrativeTradingBot:
         trade_sol = self.risk.position_size_sol(sol_price)
         trade_usd = trade_sol * sol_price
 
+        url = candidate.dexscreener_url() if not candidate.is_pump_fun else candidate.pumpfun_url()
         logger.info(
             f"Buying {candidate.symbol} | "
             f"${trade_usd:.0f} ({trade_sol:.4f} SOL) | "
             f"MC=${candidate.market_cap_usd:,.0f} | "
-            f"Narrative={self._narrative.dominant_narrative if self._narrative else 'N/A'}"
+            f"Narrative={self._narrative.dominant_narrative if self._narrative else 'N/A'}\n"
+            f"  Contract: {candidate.mint}\n"
+            f"  Chart:    {url}"
         )
 
         result: SwapResult = await jupiter.execute_buy(
@@ -243,7 +257,11 @@ class NarrativeTradingBot:
                 narrative_score=candidate.narrative_score,
                 tx_signature=result.tx_signature,
             )
-            logger.info(f"Buy confirmed: {candidate.symbol} | tx={result.tx_signature}")
+            logger.info(
+                f"Buy confirmed: {candidate.symbol} | "
+                f"tx={result.tx_signature} | "
+                f"solscan: https://solscan.io/tx/{result.tx_signature}"
+            )
         else:
             logger.warning(f"Buy failed for {candidate.symbol}: {result.error}")
 
@@ -269,7 +287,8 @@ class NarrativeTradingBot:
                 f"[monitor] {position.symbol} | "
                 f"hold={position.hold_minutes:.0f}min | "
                 f"pnl={position.pnl_pct:+.1f}% | "
-                f"price=${position.current_price_usd:.8f}"
+                f"price=${position.current_price_usd:.8f} | "
+                f"https://dexscreener.com/solana/{mint}"
             )
 
             should_exit, reason = self.risk.should_exit(position)
@@ -287,7 +306,8 @@ class NarrativeTradingBot:
         logger.info(
             f"Exiting {position.symbol} | "
             f"Reason={reason.value} | "
-            f"PnL={position.pnl_pct:+.1f}%"
+            f"PnL={position.pnl_pct:+.1f}% | "
+            f"{position.mint}"
         )
 
         result: SwapResult = await jupiter.execute_sell(
@@ -308,6 +328,7 @@ class NarrativeTradingBot:
             logger.info(
                 f"Sell confirmed: {position.symbol} | "
                 f"PnL={pnl_sol:+.4f} SOL (${pnl_sol * sol_price:+.2f}) | "
+                f"held={position.hold_minutes:.0f}min | "
                 f"tx={result.tx_signature}"
             )
         else:

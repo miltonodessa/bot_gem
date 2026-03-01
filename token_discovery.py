@@ -97,8 +97,14 @@ class TokenCandidate:
         zone = "GOLD" if self.in_golden_zone else ("EXT" if self.in_extended_zone else "OUT")
         return (
             f"Token({self.symbol} | MC=${self.market_cap_usd:,.0f} [{zone}] "
-            f"| Liq=${self.liquidity_usd:,.0f} | score={self.entry_score:.2f})"
+            f"| Liq=${self.liquidity_usd:,.0f} | score={self.entry_score:.2f} | {self.mint})"
         )
+
+    def dexscreener_url(self) -> str:
+        return f"https://dexscreener.com/solana/{self.mint}"
+
+    def pumpfun_url(self) -> str:
+        return f"https://pump.fun/{self.mint}"
 
 
 class TokenDiscovery:
