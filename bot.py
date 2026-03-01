@@ -18,6 +18,8 @@ Strategy summary (from wallet AF6sy... analysis):
 """
 
 import asyncio
+import hashlib
+import random
 import signal
 import sys
 import os
@@ -163,9 +165,10 @@ class NarrativeTradingBot:
             await asyncio.sleep(self.MONITOR_INTERVAL_SECONDS)
 
     async def _status_loop(self):
-        """Print status every 5 minutes."""
+        """Print status every 60s in dry run, every 5 min in live."""
+        interval = 60 if config.dry_run else 300
         while self._running:
-            await asyncio.sleep(300)
+            await asyncio.sleep(interval)
             self._print_status()
 
     # ── Core trading logic ────────────────────────────────────────────────────
@@ -199,7 +202,7 @@ class NarrativeTradingBot:
                 narrative_score=candidate.narrative_score,
             )
             if not can_enter:
-                logger.debug(f"Entry blocked for {candidate.symbol}: {reason}")
+                logger.info(f"Entry blocked [{candidate.symbol}]: {reason}")
                 continue
 
             logger.info(f"Entering: {candidate}")
@@ -254,15 +257,53 @@ class NarrativeTradingBot:
         sol_price = await jupiter.get_sol_price()
 
         for mint, position in list(self.risk.open_positions.items()):
-            # Refresh current price
+            # Refresh current price — fall back to simulation in DRY_RUN
             token_info = await discovery.get_token_info(mint)
             if token_info:
                 position.current_price_usd = token_info.price_usd
+            elif config.dry_run:
+                position.current_price_usd = self._simulate_dry_run_price(position)
+
+            logger.info(
+                f"[monitor] {position.symbol} | "
+                f"hold={position.hold_minutes:.0f}min | "
+                f"pnl={position.pnl_pct:+.1f}% | "
+                f"price=${position.current_price_usd:.6f}"
+            )
 
             # Check exit conditions
             should_exit, reason = self.risk.should_exit(position)
             if should_exit:
                 await self._execute_exit(position, reason, jupiter, sol_price)
+
+    def _simulate_dry_run_price(self, position: Position) -> float:
+        """
+        Simulate meme coin price action for DRY_RUN testing.
+        Uses deterministic seed (mint + hold time bucket) so price changes
+        smoothly over time rather than jumping every 30s check.
+        """
+        hold_h = position.hold_hours
+        # New seed every ~6 minutes so price evolves gradually
+        time_bucket = int(hold_h * 10)  # changes every 6 min
+        seed = int(hashlib.md5(f"{position.mint}{time_bucket}".encode()).hexdigest(), 16) % (2**32)
+        rng = random.Random(seed)
+
+        # Meme coin model: big move in first hour, then fade
+        if hold_h < 0.25:
+            # 0–15 min: initial price discovery, ±20%
+            pct = rng.uniform(-20, 25)
+        elif hold_h < 0.75:
+            # 15–45 min: conviction window — pump or dump
+            outcomes = [-28, -15, 35, 90, 160]
+            pct = outcomes[rng.randint(0, len(outcomes) - 1)] + rng.uniform(-8, 8)
+        elif hold_h < 2.0:
+            # 45 min–2h: usually fading from peak
+            pct = rng.uniform(-35, 30)
+        else:
+            # >2h: gradual bleed (wallet analysis: >2h = bad zone)
+            pct = rng.uniform(-50, -10)
+
+        return max(position.entry_price_usd * 0.01, position.entry_price_usd * (1 + pct / 100))
 
     async def _execute_exit(
         self,
@@ -285,9 +326,13 @@ class NarrativeTradingBot:
         )
 
         if result.success:
-            # Calculate actual SOL PnL
-            received_sol = result.out_amount / 1e9
-            pnl_sol = received_sol - position.entry_sol - result.fee_sol
+            if config.dry_run:
+                # DRY RUN: derive PnL from simulated price change, not from
+                # meaningless token_amount arithmetic in the fake SwapResult
+                pnl_sol = position.entry_sol * (position.pnl_pct / 100)
+            else:
+                received_sol = result.out_amount / 1e9
+                pnl_sol = received_sol - position.entry_sol - result.fee_sol
             self.risk.register_exit(position, reason, pnl_sol)
             logger.info(
                 f"Sell confirmed: {position.symbol} | "
