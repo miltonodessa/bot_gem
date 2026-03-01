@@ -225,16 +225,48 @@ class TokenDiscovery:
     async def _fetch_dexscreener_narrative(
         self, narrative: NarrativeReport
     ) -> list[TokenCandidate]:
-        """Search DexScreener for tokens matching the narrative keywords."""
+        """
+        Search DexScreener using DYNAMIC keywords from today's viral events.
+
+        For each viral event we use:
+          1. The meme derivatives (predicted coin names from the event)
+          2. Explicit $TICKER mentions from Twitter
+          3. OG meme symbols if revival signal is active
+
+        This means if "Israel war" is viral today, we search for
+        ISRAEL, IDF, BIBI, GAZA, etc. on Solana DEXes.
+        """
         if not self._session:
             return []
+
         candidates = []
-        keywords = narrative.top_keywords(5)
 
-        # Also add explicitly trending token symbols from Twitter
-        keywords += narrative.trending_tokens[:5]
+        # Priority 1: meme derivatives from viral events (highest signal)
+        search_terms: list[str] = []
+        for event in getattr(narrative, "viral_events", [])[:3]:
+            search_terms.extend(event.meme_derivatives[:5])
 
-        for kw in keywords[:8]:
+        # Priority 2: $TICKER mentions from Twitter
+        search_terms.extend(narrative.trending_tokens[:8])
+
+        # Priority 3: OG meme symbols with revival signals
+        for sig in getattr(narrative, "og_signals", []):
+            if sig.is_strong:
+                search_terms.append(sig.symbol)
+
+        # Priority 4: top raw keywords as fallback
+        search_terms.extend(narrative.top_keywords(5))
+
+        # Deduplicate while preserving priority order
+        seen: set[str] = set()
+        unique_terms: list[str] = []
+        for term in search_terms:
+            t = term.strip().lower()
+            if t and t not in seen and len(t) >= 2:
+                seen.add(t)
+                unique_terms.append(t)
+
+        for kw in unique_terms[:10]:
             try:
                 url = self.DEXSCREENER_SEARCH.format(query=kw)
                 async with self._session.get(url) as resp:
@@ -248,11 +280,11 @@ class TokenDiscovery:
                         c = self._parse_dexscreener_pair(pair)
                         if c:
                             candidates.append(c)
-                await asyncio.sleep(0.2)  # rate limit
+                await asyncio.sleep(0.2)
             except Exception as e:
                 logger.debug(f"DexScreener search error for '{kw}': {e}")
 
-        logger.debug(f"DexScreener narrative search: {len(candidates)} candidates")
+        logger.debug(f"DexScreener narrative search ({len(unique_terms)} terms): {len(candidates)} candidates")
         return candidates
 
     async def _fetch_birdeye_trending(self) -> list[TokenCandidate]:
@@ -410,36 +442,55 @@ class TokenDiscovery:
         Composite entry score 0.0–1.0.
 
         Weights:
-          - Narrative alignment: 40%
-          - Market cap position within golden zone: 25%
-          - Liquidity quality: 15%
-          - Age sweetspot (5-60 min): 10%
-          - Pump.fun routing bonus: 10%
+          - Narrative alignment (dynamic viral event match): 40%
+          - Market cap position within golden zone:          25%
+          - Liquidity quality:                               15%
+          - Age sweetspot (5-60 min):                        10%
+          - Pump.fun routing bonus:                          10%
+
+        Bonuses:
+          - Token name matches a HIGH-engagement viral event: +0.15
+          - OG meme revival signal active for this token:     +0.10
         """
         score = 0.0
 
         # 1. Narrative alignment (40%)
         score += c.narrative_score * 0.40
 
-        # 2. Market cap score (25%) — closer to $5k–$10k = better
+        # 1b. Bonus: matches top viral event (score >= 0.7)
+        top_events = getattr(narrative, "viral_events", [])
+        if top_events and top_events[0].engagement_score >= 0.7:
+            name_l = c.name.lower()
+            sym_l = c.symbol.lower()
+            for kw in top_events[0].meme_derivatives[:10]:
+                if kw in name_l or kw in sym_l or name_l in kw or sym_l in kw:
+                    score += 0.15
+                    break
+
+        # 1c. Bonus: OG meme revival and this IS that OG meme
+        og_signals = getattr(narrative, "og_signals", [])
+        for sig in og_signals:
+            if sig.is_strong and sig.symbol.lower() == c.symbol.lower():
+                score += 0.10
+                break
+
+        # 2. Market cap score (25%)
         if c.in_golden_zone:
-            # Normalise within golden zone: $5k=1.0, $20k=0.5
             mc_norm = 1.0 - (c.market_cap_usd - config.min_market_cap) / (
                 config.max_market_cap - config.min_market_cap
             )
             score += max(mc_norm, 0) * 0.25
         elif c.in_extended_zone:
-            score += 0.10  # partial credit for extended zone
+            score += 0.10
 
         # 3. Liquidity (15%)
-        liq_score = min(c.liquidity_usd / 15_000, 1.0)
-        score += liq_score * 0.15
+        score += min(c.liquidity_usd / 15_000, 1.0) * 0.15
 
         # 4. Age sweetspot 5–60 min (10%)
         if 5 <= c.age_minutes <= 60:
             score += 0.10
         elif c.age_minutes < 5:
-            score += 0.03  # very new = higher risk
+            score += 0.03
 
         # 5. pump.fun routing bonus (10%)
         if c.is_pump_fun:

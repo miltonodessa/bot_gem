@@ -1,18 +1,28 @@
 """
-Twitter/X narrative scanner.
+Twitter/X viral news narrative scanner.
 
-Strategy: The target wallet trades in clusters aligned with daily Twitter narratives.
-This module detects which crypto narrative is currently trending and scores tokens against it.
+Core idea:
+  Solana memes are driven by WORLD EVENTS and VIRAL CONTENT — not sector categories.
+  Today: Israel/Gaza war news → "BIBI", "IDF", "GAZA" tokens appear on pump.fun.
+  Tomorrow: Elon posts something viral → dog/space/Mars memes pump.
+  Day after: OG memes (BONK, WIF, POPCAT) start reviving because of general Solana hype.
 
-Two modes:
-  1. Tweepy (official API v2) — requires bearer token
-  2. Fallback scraping via nitter/snscrape — no key needed
+This scanner:
+  1. Detects what is VIRALLY TRENDING right now on Twitter/X (by engagement, not category)
+  2. Extracts dynamic keywords from the "story of the day"
+  3. Generates meme-name derivatives (the words that become coin names)
+  4. Detects OG Solana meme revivals via volume/mention spikes
+  5. Returns a NarrativeReport with dynamic keywords (no fixed categories)
+
+Sources (priority order):
+  1. Twitter API v2 — top tweets by impression count in last 2h
+  2. Nitter scraping — engagement proxy via like/retweet counts
+  3. Trending topics from public APIs (trends24.in etc.)
 """
 
 import asyncio
 import re
-import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -20,64 +30,120 @@ from typing import Optional
 import aiohttp
 from loguru import logger
 
-from config import (
-    BASE_NARRATIVE_CATEGORIES,
-    ALPHA_TWITTER_ACCOUNTS,
-    TRENDING_HASHTAGS,
-    config,
-)
+from config import config, OG_SOLANA_MEMES, VIRAL_SEED_ACCOUNTS
+
+
+# ── Data models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class ViralEvent:
+    """A single viral story / topic detected on Twitter."""
+    topic: str                    # Human-readable label, e.g. "Israel war news"
+    raw_keywords: list[str]       # Words extracted from viral tweets
+    meme_derivatives: list[str]   # Predicted meme-coin name candidates
+    engagement_score: float       # Normalised 0–1 (views + likes + RTs)
+    tweet_count: int              # Number of viral tweets on this topic
+    velocity: float               # Tweets/hour gaining momentum
+    sample_tweets: list[str]      # Up to 3 tweet snippets
+    detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __repr__(self) -> str:
+        return (
+            f"ViralEvent('{self.topic}' | score={self.engagement_score:.2f} "
+            f"| derivatives={self.meme_derivatives[:5]})"
+        )
+
+
+@dataclass
+class OGMemeSignal:
+    """Revival signal for an established Solana OG meme."""
+    symbol: str
+    mint: str
+    twitter_mentions_1h: int
+    volume_spike_pct: float       # % increase vs 1h ago
+    price_change_1h_pct: float
+    signal_strength: float        # 0–1
+
+    @property
+    def is_strong(self) -> bool:
+        return self.signal_strength >= 0.6
 
 
 @dataclass
 class NarrativeScore:
     category: str
-    score: float          # 0.0 – 1.0
+    score: float
     keywords_hit: list
     tweet_count: int
-    velocity: float       # tweets per hour
+    velocity: float
     top_accounts: list
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def is_fresh(self, max_age_minutes: int = 120) -> bool:
-        age = datetime.now(timezone.utc) - self.updated_at
-        return age < timedelta(minutes=max_age_minutes)
+        return (datetime.now(timezone.utc) - self.updated_at) < timedelta(minutes=max_age_minutes)
 
 
 @dataclass
 class NarrativeReport:
-    """Aggregated daily narrative intelligence."""
+    """
+    Dynamic narrative report — driven by what's actually viral today.
+
+    dominant_narrative: e.g. "ISRAEL_WAR", "ELON_MARS", "OG_MEME_REVIVAL"
+    viral_events:       ranked list of viral stories with meme derivatives
+    og_signals:         OG meme coins showing revival signals
+    meme_keywords:      flat list of all meme-worthy keywords (coin name candidates)
+    trending_tokens:    $TICKER symbols explicitly mentioned on Twitter
+    trending_mints:     resolved Solana mints (if detected)
+    raw_keywords:       all keywords sorted by engagement weight
+    """
     dominant_narrative: str
-    narratives: list[NarrativeScore]
-    trending_tokens: list[str]       # raw token symbols/names extracted from Twitter
-    trending_mints: list[str]        # resolved Solana mint addresses (if any)
+    viral_events: list[ViralEvent]
+    og_signals: list[OGMemeSignal]
+    narratives: list[NarrativeScore]    # kept for compatibility with bot.py
+    meme_keywords: list[str]
+    trending_tokens: list[str]
+    trending_mints: list[str]
     raw_keywords: list[str]
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def top_keywords(self, n: int = 20) -> list[str]:
-        return self.raw_keywords[:n]
+        return self.meme_keywords[:n]
 
     def is_valid_hour_to_trade(self, optimal_hours: list, avoid_hours: list) -> bool:
         current_hour = datetime.now(timezone.utc).hour
-        if current_hour in avoid_hours:
-            return False
-        return current_hour in optimal_hours
+        return current_hour not in avoid_hours and current_hour in optimal_hours
 
+    def has_og_revival(self) -> bool:
+        return any(s.is_strong for s in self.og_signals)
+
+    def __repr__(self) -> str:
+        events = " | ".join(e.topic for e in self.viral_events[:3])
+        return f"NarrativeReport('{self.dominant_narrative}' | events=[{events}])"
+
+
+# ── Main scanner ──────────────────────────────────────────────────────────────
 
 class TwitterNarrativeScanner:
     """
-    Scans Twitter/X for current crypto narratives.
+    Viral event-driven narrative scanner.
 
-    Priority:
-      1. Official Tweepy API (if bearer token set)
-      2. Nitter public instance scraping (fallback)
-      3. Static keyword trending (last resort)
+    Instead of checking predefined categories, this scanner:
+      - Fetches the most-engaged tweets from the last 2 hours
+      - Clusters them by topic/entity
+      - Extracts meme-worthy keywords that will appear as coin names on pump.fun
+      - Separately checks OG Solana meme revival signals
     """
 
     NITTER_INSTANCES = [
         "https://nitter.net",
         "https://nitter.privacydev.net",
         "https://nitter.poast.org",
+        "https://nitter.1d4.us",
     ]
+
+    # Minimum engagement to consider a tweet "viral"
+    VIRAL_IMPRESSION_THRESHOLD = 50_000
+    VIRAL_ENGAGEMENT_THRESHOLD = 2_000   # likes + RTs combined
 
     def __init__(self):
         self._cache: Optional[NarrativeReport] = None
@@ -87,7 +153,10 @@ class TwitterNarrativeScanner:
     async def __aenter__(self):
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
-            headers={"User-Agent": "SolanaTradeBot/1.0"}
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                "Accept": "application/json, text/html",
+            },
         )
         return self
 
@@ -95,90 +164,195 @@ class TwitterNarrativeScanner:
         if self._session:
             await self._session.close()
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     async def get_narrative(self, force_refresh: bool = False) -> NarrativeReport:
-        """Return current narrative report (cached for NARRATIVE_REFRESH_MINUTES)."""
         if self._cache and not force_refresh:
-            if self._cache.narratives and self._cache.narratives[0].is_fresh(
-                config.narrative_refresh_minutes
-            ):
-                logger.debug("Returning cached narrative report")
+            age = datetime.now(timezone.utc) - self._cache.generated_at
+            if age < timedelta(minutes=config.narrative_refresh_minutes):
+                logger.debug("Returning cached narrative")
                 return self._cache
 
-        logger.info("Refreshing Twitter narrative scan...")
-        report = await self._scan_narratives()
+        logger.info("Scanning Twitter for viral events...")
+        report = await self._build_narrative()
         self._cache = report
+        logger.info(repr(report))
         return report
 
     async def score_token_against_narrative(
         self, token_name: str, token_symbol: str, narrative: NarrativeReport
     ) -> float:
         """
-        Score how well a token matches the current narrative.
-        Returns 0.0 – 1.0.
+        Score 0.0–1.0: how well this token matches today's viral events.
+
+        Scoring logic:
+          - Direct name/symbol match in meme_keywords:         +0.50
+          - Fuzzy match (substring of keyword or vice versa):  +0.30
+          - Token symbol in trending_tokens (Twitter $tickers):+0.40
+          - OG meme revival signal active + token is OG:       +0.35
+          - Generic viral bonus (any match in raw_keywords):   +0.15
         """
         score = 0.0
-        name_lower = token_name.lower()
-        sym_lower = token_symbol.lower()
-        keywords = narrative.top_keywords(30)
+        name_l = token_name.lower().strip()
+        sym_l = token_symbol.lower().strip()
+        meme_kws = [k.lower() for k in narrative.meme_keywords]
+        raw_kws = [k.lower() for k in narrative.raw_keywords]
 
-        # Direct name/symbol match in trending keywords
-        for kw in keywords:
-            if kw in name_lower or kw in sym_lower:
-                score += 0.25
+        # 1. Exact match in meme keyword list
+        for kw in meme_kws[:40]:
+            if kw == name_l or kw == sym_l:
+                score += 0.50
+                break
+            if kw in name_l or name_l in kw or kw in sym_l or sym_l in kw:
+                score += 0.30
                 break
 
-        # Check against dominant narrative keywords
-        dom_cat = BASE_NARRATIVE_CATEGORIES.get(narrative.dominant_narrative, [])
-        for kw in dom_cat:
-            if kw in name_lower or kw in sym_lower:
+        # 2. Explicit $TICKER mention on Twitter
+        if sym_l.upper() in [t.upper() for t in narrative.trending_tokens]:
+            score += 0.40
+
+        # 3. OG meme revival — if this token IS an OG meme and there's a revival signal
+        for sig in narrative.og_signals:
+            if sig.symbol.lower() == sym_l and sig.is_strong:
                 score += 0.35
                 break
 
-        # Token appears explicitly in trending_tokens list
-        if token_symbol.upper() in [t.upper() for t in narrative.trending_tokens]:
-            score += 0.40
+        # 4. Any match in raw keywords (weaker signal)
+        if score < 0.15:
+            for kw in raw_kws[:60]:
+                if len(kw) >= 3 and (kw in name_l or kw in sym_l):
+                    score += 0.15
+                    break
 
         return min(score, 1.0)
 
-    # ── Internal scan logic ───────────────────────────────────────────────────
+    # ── Internal orchestration ────────────────────────────────────────────────
 
-    async def _scan_narratives(self) -> NarrativeReport:
-        if self._use_api:
-            try:
-                return await self._scan_via_twitter_api()
-            except Exception as e:
-                logger.warning(f"Twitter API failed ({e}), falling back to scraping")
+    async def _build_narrative(self) -> NarrativeReport:
+        """Orchestrate all data sources and build the report."""
+        viral_events: list[ViralEvent] = []
+        og_signals: list[OGMemeSignal] = []
+        trending_tokens: list[str] = []
+
+        # Fetch viral tweets and OG meme data concurrently
+        viral_task = asyncio.create_task(self._fetch_viral_tweets())
+        og_task = asyncio.create_task(self._check_og_meme_signals())
 
         try:
-            return await self._scan_via_nitter()
+            raw_viral = await viral_task
         except Exception as e:
-            logger.warning(f"Nitter scraping failed ({e}), using static analysis")
+            logger.warning(f"Viral tweet fetch failed: {e}")
+            raw_viral = []
 
-        return self._static_narrative_report()
+        try:
+            og_signals = await og_task
+        except Exception as e:
+            logger.warning(f"OG meme check failed: {e}")
+            og_signals = []
 
-    async def _scan_via_twitter_api(self) -> NarrativeReport:
-        """Use official Twitter API v2 search."""
+        # Cluster raw viral tweets into events
+        viral_events = self._cluster_into_events(raw_viral)
+
+        # Extract all $TICKER mentions
+        for tweet_text in raw_viral:
+            trending_tokens.extend(self._extract_ticker_mentions(tweet_text))
+        trending_tokens = list(dict.fromkeys(t.upper() for t in trending_tokens))
+
+        # Build flat meme keyword list from all events
+        meme_keywords: list[str] = []
+        for event in viral_events:
+            meme_keywords.extend(event.meme_derivatives)
+            meme_keywords.extend(event.raw_keywords)
+
+        # Add OG meme symbols if revival signals are strong
+        for sig in og_signals:
+            if sig.is_strong:
+                meme_keywords.insert(0, sig.symbol.lower())
+
+        # Deduplicate preserving order
+        seen: set[str] = set()
+        unique_kws: list[str] = []
+        for kw in meme_keywords:
+            kw_l = kw.lower().strip()
+            if kw_l and kw_l not in seen:
+                seen.add(kw_l)
+                unique_kws.append(kw_l)
+
+        # Determine dominant narrative label
+        dominant = self._determine_dominant(viral_events, og_signals)
+
+        # Build compatibility NarrativeScore list
+        compat_scores = [
+            NarrativeScore(
+                category=e.topic.upper().replace(" ", "_")[:20],
+                score=e.engagement_score,
+                keywords_hit=e.meme_derivatives[:5],
+                tweet_count=e.tweet_count,
+                velocity=e.velocity,
+                top_accounts=[],
+            )
+            for e in viral_events[:5]
+        ]
+
+        return NarrativeReport(
+            dominant_narrative=dominant,
+            viral_events=viral_events,
+            og_signals=og_signals,
+            narratives=compat_scores,
+            meme_keywords=unique_kws,
+            trending_tokens=trending_tokens,
+            trending_mints=[],
+            raw_keywords=unique_kws,
+        )
+
+    # ── Viral tweet fetching ──────────────────────────────────────────────────
+
+    async def _fetch_viral_tweets(self) -> list[str]:
+        """
+        Fetch high-engagement tweets from last 2h.
+        Returns list of tweet text strings.
+        """
+        if self._use_api:
+            try:
+                return await self._fetch_viral_via_api()
+            except Exception as e:
+                logger.warning(f"Twitter API viral fetch failed: {e}")
+
+        try:
+            return await self._fetch_viral_via_nitter()
+        except Exception as e:
+            logger.warning(f"Nitter viral fetch failed: {e}")
+
+        # Last resort: fetch from public trending sources
+        return await self._fetch_from_trending_sources()
+
+    async def _fetch_viral_via_api(self) -> list[str]:
+        """Twitter API v2 — search top tweets by engagement in last 2h."""
         if not self._session:
-            raise RuntimeError("Session not initialised")
+            return []
 
         headers = {"Authorization": f"Bearer {config.twitter_bearer_token}"}
-        keyword_counts: Counter = Counter()
-        token_mentions: Counter = Counter()
-        account_hits: dict = defaultdict(int)
+        two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
-        # Search recent tweets for each narrative category
-        for category, keywords in BASE_NARRATIVE_CATEGORIES.items():
-            query = " OR ".join(f'"{kw}"' for kw in keywords[:5])
-            query += " lang:en -is:retweet"
+        # Queries targeting crypto-adjacent viral content + world news
+        queries = [
+            # General high-engagement crypto/meme
+            "(solana OR sol OR pumpfun OR memecoin) -is:retweet lang:en min_faves:500",
+            # World news that spawns memes
+            "(breaking OR viral OR trending OR news) -is:retweet lang:en min_faves:2000",
+            # Alpha accounts' recent posts
+            f"(from:{' OR from:'.join(VIRAL_SEED_ACCOUNTS[:8])}) -is:retweet",
+        ]
+
+        tweet_texts: list[str] = []
+
+        for query in queries:
             params = {
                 "query": query,
-                "max_results": 100,
-                "tweet.fields": "created_at,author_id,public_metrics",
-                "start_time": (
-                    datetime.now(timezone.utc) - timedelta(hours=6)
-                ).isoformat(),
+                "max_results": "100",
+                "tweet.fields": "public_metrics,created_at,lang",
+                "sort_order": "relevancy",
+                "start_time": two_hours_ago,
             }
             try:
                 async with self._session.get(
@@ -186,218 +360,440 @@ class TwitterNarrativeScanner:
                     headers=headers,
                     params=params,
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        tweets = data.get("data", [])
-                        for tweet in tweets:
-                            text = tweet.get("text", "").lower()
-                            for kw in keywords:
-                                if kw in text:
-                                    keyword_counts[kw] += 1
-                            extracted = self._extract_token_mentions(text)
-                            for t in extracted:
-                                token_mentions[t] += 1
-                    elif resp.status == 429:
-                        logger.warning("Twitter API rate limited, sleeping 15s")
+                    if resp.status == 429:
+                        logger.warning("Twitter API rate limited")
                         await asyncio.sleep(15)
+                        continue
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    for tweet in data.get("data", []):
+                        metrics = tweet.get("public_metrics", {})
+                        impressions = metrics.get("impression_count", 0)
+                        likes = metrics.get("like_count", 0)
+                        rts = metrics.get("retweet_count", 0)
+                        engagement = likes + rts * 2
+
+                        # Only keep genuinely viral content
+                        if impressions >= self.VIRAL_IMPRESSION_THRESHOLD or engagement >= self.VIRAL_ENGAGEMENT_THRESHOLD:
+                            tweet_texts.append(tweet.get("text", ""))
+
+                    await asyncio.sleep(0.5)
             except Exception as e:
-                logger.debug(f"API search error for {category}: {e}")
+                logger.debug(f"API query error: {e}")
 
-        # Also search monitored accounts
-        for account in ALPHA_TWITTER_ACCOUNTS[:5]:
-            try:
-                params = {
-                    "query": f"from:{account}",
-                    "max_results": 10,
-                    "tweet.fields": "created_at,public_metrics",
-                }
-                async with self._session.get(
-                    "https://api.twitter.com/2/tweets/search/recent",
-                    headers=headers,
-                    params=params,
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for tweet in data.get("data", []):
-                            text = tweet.get("text", "").lower()
-                            for token in self._extract_token_mentions(text):
-                                token_mentions[token] += 1
-                                account_hits[account] += 1
-            except Exception:
-                pass
+        logger.debug(f"Twitter API viral fetch: {len(tweet_texts)} viral tweets")
+        return tweet_texts
 
-        return self._build_report(keyword_counts, token_mentions, account_hits)
-
-    async def _scan_via_nitter(self) -> NarrativeReport:
-        """Scrape Nitter instances for trending crypto content."""
+    async def _fetch_viral_via_nitter(self) -> list[str]:
+        """Scrape Nitter for high-engagement tweets from alpha accounts."""
         if not self._session:
-            raise RuntimeError("Session not initialised")
+            return []
 
-        keyword_counts: Counter = Counter()
-        token_mentions: Counter = Counter()
-        account_hits: dict = defaultdict(int)
+        tweet_texts: list[str] = []
 
         for instance in self.NITTER_INSTANCES:
             try:
-                # Search trending crypto hashtags
-                for hashtag in TRENDING_HASHTAGS[:6]:
-                    tag = hashtag.lstrip("#")
-                    url = f"{instance}/search?q=%23{tag}&f=tweets"
-                    async with self._session.get(url) as resp:
-                        if resp.status == 200:
+                # Scan viral seed accounts
+                for account in VIRAL_SEED_ACCOUNTS[:10]:
+                    try:
+                        url = f"{instance}/{account}"
+                        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                            if resp.status != 200:
+                                continue
                             html = await resp.text()
-                            texts = self._extract_text_from_html(html)
-                            for text in texts:
-                                text_lower = text.lower()
-                                for cat_kws in BASE_NARRATIVE_CATEGORIES.values():
-                                    for kw in cat_kws:
-                                        if kw in text_lower:
-                                            keyword_counts[kw] += 1
-                                for token in self._extract_token_mentions(text_lower):
-                                    token_mentions[token] += 1
-                    await asyncio.sleep(0.5)
+                            tweets = self._extract_tweets_from_nitter_html(html)
+                            tweet_texts.extend(tweets)
+                        await asyncio.sleep(0.4)
+                    except Exception:
+                        continue
 
-                # Scan alpha accounts
-                for account in ALPHA_TWITTER_ACCOUNTS[:8]:
-                    url = f"{instance}/{account}"
-                    async with self._session.get(url) as resp:
-                        if resp.status == 200:
-                            html = await resp.text()
-                            texts = self._extract_text_from_html(html)
-                            for text in texts[:5]:
-                                for token in self._extract_token_mentions(text.lower()):
-                                    token_mentions[token] += 1
-                                    account_hits[account] += 1
-                    await asyncio.sleep(0.3)
+                # Scan for breaking news / viral content
+                for tag in ["breaking", "viral", "solana", "meme"]:
+                    try:
+                        url = f"{instance}/search?q=%23{tag}+min_faves%3A500&f=tweets"
+                        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                            if resp.status == 200:
+                                html = await resp.text()
+                                tweets = self._extract_tweets_from_nitter_html(html)
+                                tweet_texts.extend(tweets)
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        continue
 
-                break  # success with this instance
+                if tweet_texts:
+                    break  # One working instance is enough
+
             except Exception as e:
                 logger.debug(f"Nitter {instance} failed: {e}")
+
+        logger.debug(f"Nitter viral fetch: {len(tweet_texts)} tweets")
+        return tweet_texts
+
+    async def _fetch_from_trending_sources(self) -> list[str]:
+        """
+        Fallback: fetch trending topics from public sources
+        (trends24.in, getdaytrends.com, etc.)
+        """
+        if not self._session:
+            return []
+
+        tweet_texts: list[str] = []
+
+        # trends24 is publicly accessible and shows trending Twitter topics
+        sources = [
+            ("https://trends24.in/united-states/", "trend-card__list"),
+            ("https://trends24.in/worldwide/", "trend-card__list"),
+        ]
+
+        for url, css_hint in sources:
+            try:
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        # Extract trend names (they appear as list items)
+                        trends = re.findall(r'<a[^>]+>([^<]{2,40})</a>', html)
+                        for trend in trends:
+                            trend = trend.strip()
+                            if 2 < len(trend) < 40 and not trend.startswith("http"):
+                                tweet_texts.append(trend)
+            except Exception as e:
+                logger.debug(f"Trending source {url} failed: {e}")
+
+        logger.debug(f"Trending sources fallback: {len(tweet_texts)} items")
+        return tweet_texts
+
+    # ── OG meme revival detection ─────────────────────────────────────────────
+
+    async def _check_og_meme_signals(self) -> list[OGMemeSignal]:
+        """
+        Check if established Solana OG memes are showing revival signals
+        (volume spike + Twitter mention increase).
+        """
+        if not self._session:
+            return []
+
+        signals: list[OGMemeSignal] = []
+
+        for symbol, mint in OG_SOLANA_MEMES.items():
+            try:
+                signal = await self._check_single_og_meme(symbol, mint)
+                if signal:
+                    signals.append(signal)
+            except Exception as e:
+                logger.debug(f"OG meme check failed for {symbol}: {e}")
+
+        # Sort by signal strength
+        signals.sort(key=lambda s: s.signal_strength, reverse=True)
+        strong = [s for s in signals if s.is_strong]
+        if strong:
+            logger.info(f"OG meme revival signals: {[s.symbol for s in strong]}")
+
+        return signals
+
+    async def _check_single_og_meme(self, symbol: str, mint: str) -> Optional[OGMemeSignal]:
+        """Fetch DexScreener data to detect volume/price spike for one OG meme."""
+        if not self._session:
+            return None
+
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            pairs = data.get("pairs") or []
+            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+            if not sol_pairs:
+                return None
+
+            # Pick pair with most liquidity
+            pair = max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0)))
+
+            price_change_1h = float((pair.get("priceChange") or {}).get("h1", 0))
+            vol_h1 = float((pair.get("volume") or {}).get("h1", 0))
+            vol_h24 = float((pair.get("volume") or {}).get("h24", 0))
+
+            # Volume spike: h1 volume is unusually high vs daily average
+            avg_hourly_vol = vol_h24 / 24 if vol_h24 > 0 else 1
+            vol_spike_pct = ((vol_h1 - avg_hourly_vol) / avg_hourly_vol * 100) if avg_hourly_vol > 0 else 0
+
+            # Signal strength formula
+            # Price up >15% in 1h OR volume spike >3x normal → strong signal
+            price_component = min(max(price_change_1h, 0) / 30, 1.0)   # 30% = max
+            vol_component = min(max(vol_spike_pct, 0) / 300, 1.0)       # 300% = max
+            strength = price_component * 0.5 + vol_component * 0.5
+
+            return OGMemeSignal(
+                symbol=symbol,
+                mint=mint,
+                twitter_mentions_1h=0,   # populated if Twitter API available
+                volume_spike_pct=vol_spike_pct,
+                price_change_1h_pct=price_change_1h,
+                signal_strength=strength,
+            )
+
+    # ── Event clustering ──────────────────────────────────────────────────────
+
+    def _cluster_into_events(self, tweet_texts: list[str]) -> list[ViralEvent]:
+        """
+        Cluster tweet texts into distinct viral events using keyword frequency.
+
+        Algorithm:
+          1. Extract all meaningful words/entities from all tweets
+          2. Find top N "anchor words" (highest frequency, non-stopword)
+          3. Each anchor word = one candidate event
+          4. Assign tweets to nearest anchor
+          5. Build meme derivatives for each event
+        """
+        if not tweet_texts:
+            return [self._fallback_event()]
+
+        # Count word frequencies across all tweets
+        word_freq: Counter = Counter()
+        all_entities: list[str] = []
+
+        for text in tweet_texts:
+            words = self._extract_meaningful_words(text)
+            all_entities.extend(words)
+            word_freq.update(words)
+
+        # Top anchor words = the "stories of the day"
+        # Filter out very generic words
+        GENERIC_WORDS = {
+            "crypto", "bitcoin", "ethereum", "blockchain", "token", "coin",
+            "market", "price", "bull", "bear", "buy", "sell", "pump", "dump",
+            "solana", "sol", "defi", "nft", "web3", "launch", "new",
+        }
+        anchor_candidates = [
+            (word, count) for word, count in word_freq.most_common(100)
+            if word not in GENERIC_WORDS and len(word) >= 3 and count >= 2
+        ]
+
+        if not anchor_candidates:
+            return [self._fallback_event()]
+
+        # Build events from top anchors (max 5 distinct events)
+        events: list[ViralEvent] = []
+        used_words: set[str] = set()
+
+        for anchor_word, anchor_count in anchor_candidates[:20]:
+            if anchor_word in used_words:
+                continue
+            if len(events) >= 5:
+                break
+
+            # Find tweets containing this anchor
+            related_tweets = [
+                t for t in tweet_texts
+                if anchor_word in t.lower()
+            ]
+            if len(related_tweets) < 2:
                 continue
 
-        return self._build_report(keyword_counts, token_mentions, account_hits)
+            # Extract all words from related tweets
+            related_words: Counter = Counter()
+            for t in related_tweets:
+                related_words.update(self._extract_meaningful_words(t))
 
-    def _static_narrative_report(self) -> NarrativeReport:
-        """Last-resort fallback: use time-of-day heuristics."""
-        hour = datetime.now(timezone.utc).hour
-        # Morning EU session → AI narrative strong
-        if 6 <= hour <= 12:
-            dominant = "AI_AGENTS"
-        # US session → Meme meta hot
-        elif 13 <= hour <= 21:
-            dominant = "MEME_META"
-        else:
-            dominant = "DEPIN"
+            # Mark these words as "used" to avoid duplicate events
+            top_related = [w for w, _ in related_words.most_common(10)]
+            used_words.update(top_related[:5])
 
-        narratives = [
-            NarrativeScore(
-                category=dominant,
-                score=0.5,
-                keywords_hit=BASE_NARRATIVE_CATEGORIES[dominant][:3],
-                tweet_count=0,
-                velocity=0.0,
-                top_accounts=[],
+            # Build meme derivatives — the actual words that become coin names
+            meme_derivs = self._generate_meme_derivatives(
+                anchor_word, related_words
             )
-        ]
-        return NarrativeReport(
-            dominant_narrative=dominant,
-            narratives=narratives,
-            trending_tokens=[],
-            trending_mints=[],
-            raw_keywords=BASE_NARRATIVE_CATEGORIES[dominant],
+
+            # Engagement score = log-scaled tweet count
+            import math
+            eng_score = min(math.log(len(related_tweets) + 1) / math.log(50), 1.0)
+
+            events.append(ViralEvent(
+                topic=self._humanize_topic(anchor_word, top_related),
+                raw_keywords=top_related,
+                meme_derivatives=meme_derivs,
+                engagement_score=eng_score,
+                tweet_count=len(related_tweets),
+                velocity=len(related_tweets) / 2.0,   # per hour (2h window)
+                sample_tweets=[t[:120] for t in related_tweets[:3]],
+            ))
+
+        if not events:
+            events = [self._fallback_event()]
+
+        events.sort(key=lambda e: e.engagement_score, reverse=True)
+        logger.info(f"Detected {len(events)} viral events:")
+        for e in events:
+            logger.info(f"  {e}")
+
+        return events
+
+    # ── Meme derivative generation ────────────────────────────────────────────
+
+    def _generate_meme_derivatives(
+        self, anchor: str, related_words: Counter
+    ) -> list[str]:
+        """
+        Generate the meme-coin name candidates from a viral event.
+
+        Logic: When "Israel" trends → meme coins named ISRAEL, IDF, BIBI, NETANYAHU,
+        GAZA, IDF, HAMAS (the people/places/things in the story).
+        When "Elon Musk Mars" trends → ELON, MARS, SPACEX, ROCKET, X.
+        These are the EXACT names that pump.fun creators use.
+        """
+        derivatives: list[str] = []
+        derivatives.append(anchor.lower())
+
+        # Add top related words as derivatives
+        for word, _ in related_words.most_common(15):
+            if len(word) >= 2 and word != anchor:
+                derivatives.append(word.lower())
+
+        # Add common meme suffix/prefix patterns
+        meme_variations = []
+        for deriv in derivatives[:5]:
+            # Common pump.fun naming patterns
+            meme_variations.append(deriv)
+            meme_variations.append(f"{deriv}inu")      # e.g. "israelinu"
+            meme_variations.append(f"${deriv.upper()}")
+
+        derivatives.extend(meme_variations)
+
+        # Deduplicate
+        seen: set[str] = set()
+        result: list[str] = []
+        for d in derivatives:
+            d_clean = d.lower().strip("$").strip()
+            if d_clean and d_clean not in seen and len(d_clean) >= 2:
+                seen.add(d_clean)
+                result.append(d_clean)
+
+        return result[:25]
+
+    # ── Dominant narrative ────────────────────────────────────────────────────
+
+    def _determine_dominant(
+        self, events: list[ViralEvent], og_signals: list[OGMemeSignal]
+    ) -> str:
+        """Label the dominant narrative for logging / bot status display."""
+        strong_og = [s for s in og_signals if s.is_strong]
+
+        if strong_og and (not events or events[0].engagement_score < 0.5):
+            # OG meme revival dominates when no viral news event
+            symbols = "+".join(s.symbol for s in strong_og[:2])
+            return f"OG_REVIVAL_{symbols}"
+
+        if events:
+            topic = events[0].topic.upper().replace(" ", "_").replace("/", "_")
+            # Truncate for readability
+            return topic[:30]
+
+        return "UNKNOWN"
+
+    # ── Fallback ──────────────────────────────────────────────────────────────
+
+    def _fallback_event(self) -> ViralEvent:
+        """Return a generic event when no data is available."""
+        return ViralEvent(
+            topic="Solana Meme Season",
+            raw_keywords=["solana", "meme", "pump", "moon", "gem", "ape"],
+            meme_derivatives=["sol", "meme", "doge", "pepe", "frog", "cat", "dog"],
+            engagement_score=0.2,
+            tweet_count=0,
+            velocity=0.0,
+            sample_tweets=[],
         )
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Text helpers ──────────────────────────────────────────────────────────
 
-    def _build_report(
-        self,
-        keyword_counts: Counter,
-        token_mentions: Counter,
-        account_hits: dict,
-    ) -> NarrativeReport:
-        """Convert raw counts into a structured NarrativeReport."""
-        category_scores: dict[str, NarrativeScore] = {}
-
-        for category, keywords in BASE_NARRATIVE_CATEGORIES.items():
-            hits = {kw: keyword_counts.get(kw, 0) for kw in keywords}
-            total = sum(hits.values())
-            hit_keywords = [kw for kw, cnt in hits.items() if cnt > 0]
-            score = min(total / max(len(keywords) * 5, 1), 1.0)
-
-            if total > 0:
-                category_scores[category] = NarrativeScore(
-                    category=category,
-                    score=score,
-                    keywords_hit=hit_keywords,
-                    tweet_count=total,
-                    velocity=total / 6.0,  # per hour over 6h window
-                    top_accounts=[a for a, c in account_hits.items() if c > 0],
-                )
-
-        # Sort by score descending
-        sorted_narratives = sorted(
-            category_scores.values(), key=lambda n: n.score, reverse=True
-        )
-
-        dominant = sorted_narratives[0].category if sorted_narratives else "MEME_META"
-
-        # Top trending tokens from Twitter
-        trending_tokens = [t.upper() for t, _ in token_mentions.most_common(30)]
-
-        # All keywords sorted by count
-        raw_keywords = [kw for kw, _ in keyword_counts.most_common(50)]
-
-        logger.info(
-            f"Narrative scan complete. Dominant: {dominant} "
-            f"({len(sorted_narratives)} categories active)"
-        )
-        for ns in sorted_narratives[:3]:
-            logger.info(f"  {ns.category}: score={ns.score:.2f}, tweets={ns.tweet_count}")
-
-        return NarrativeReport(
-            dominant_narrative=dominant,
-            narratives=sorted_narratives,
-            trending_tokens=trending_tokens,
-            trending_mints=[],
-            raw_keywords=raw_keywords,
-        )
-
-    @staticmethod
-    def _extract_token_mentions(text: str) -> list[str]:
-        """Extract potential token symbols from tweet text."""
-        # Match $TOKEN patterns
-        dollar_tickers = re.findall(r"\$([A-Z]{2,10})\b", text.upper())
-        # Match standalone uppercase 2-8 char words that look like tickers
-        bare_tickers = re.findall(r"\b([A-Z]{2,8})\b", text.upper())
-
-        # Filter out common English words
-        stop_words = {
-            "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL",
-            "CAN", "HER", "WAS", "ONE", "OUR", "OUT", "DAY", "GET",
-            "HAS", "HIM", "HIS", "HOW", "ITS", "MAY", "NEW", "NOW",
-            "OLD", "SEE", "TWO", "WAY", "WHO", "BOY", "DID", "GOT",
-            "LET", "PUT", "SAY", "SHE", "TOO", "USE", "SOL", "BTC",
-            "ETH", "USD", "ATH", "ATL", "LFG", "GG", "IMO", "FUD",
-            "FOMO", "DEX", "CEX", "APR", "APY", "TVL", "RPC", "NFT",
-            "DAO", "DeFi", "P2P", "P2E", "AI", "LLM"
+    def _extract_meaningful_words(self, text: str) -> list[str]:
+        """
+        Extract meaningful words/entities from text.
+        Keeps proper nouns, names, places, and meme-worthy terms.
+        Drops common stop words and generic crypto jargon.
+        """
+        STOP_WORDS = {
+            # English stop words
+            "the", "and", "for", "are", "but", "not", "you", "all", "can",
+            "her", "was", "one", "our", "out", "day", "get", "has", "him",
+            "his", "how", "its", "may", "new", "now", "old", "see", "two",
+            "way", "who", "did", "got", "let", "put", "say", "she", "too",
+            "use", "had", "man", "via", "this", "that", "with", "will",
+            "from", "have", "been", "than", "then", "they", "them", "what",
+            "when", "where", "which", "while", "about", "after", "before",
+            "there", "their", "would", "could", "should", "more", "some",
+            "just", "like", "also", "into", "over", "only", "very", "your",
+            "time", "year", "make", "take", "come", "good", "most", "know",
+            # Generic crypto
+            "crypto", "token", "coin", "market", "price", "trading", "trade",
+            "blockchain", "defi", "nft", "web3", "launch", "launched",
+            "bullish", "bearish", "pump", "dump", "ath", "atl", "wallet",
+            "buy", "sell", "hold", "hodl", "moon", "lfg", "based", "gm",
+            "https", "http", "www", "com", "amp", "via",
         }
 
-        candidates = list(dict.fromkeys(
-            t for t in dollar_tickers + bare_tickers
-            if t not in stop_words and len(t) >= 2
-        ))
-        return candidates[:20]
+        # Remove URLs
+        text = re.sub(r"https?://\S+", "", text)
+        # Remove @mentions and #tags for word extraction (but keep the text)
+        text = re.sub(r"[@#](\w+)", r" \1 ", text)
+        # Normalize
+        text = text.lower()
+        # Extract words (including hyphenated)
+        words = re.findall(r"[a-z][a-z\-']{1,30}", text)
+
+        meaningful = [
+            w for w in words
+            if w not in STOP_WORDS
+            and len(w) >= 2
+            and not w.isdigit()
+        ]
+        return meaningful
+
+    def _extract_ticker_mentions(self, text: str) -> list[str]:
+        """Extract $TICKER mentions from tweet text."""
+        # $TICKER pattern
+        dollar_tickers = re.findall(r"\$([A-Za-z]{2,10})\b", text)
+        # Cashtags in all-caps (common in crypto Twitter)
+        caps_words = re.findall(r"\b([A-Z]{2,8})\b", text)
+
+        SKIP = {
+            "THE", "AND", "FOR", "BUT", "NOT", "YOU", "ALL", "CAN", "OUT",
+            "GET", "NOW", "NEW", "SOL", "BTC", "ETH", "USD", "ATH", "ATL",
+            "LFG", "GG", "IMO", "FUD", "FOMO", "DEX", "CEX", "APR", "APY",
+            "NFT", "DAO", "AI", "USA", "WAS", "ARE", "HAS", "HAD", "DID",
+            "ITS", "OUR", "WHO", "WHY", "HOW", "INC", "LLC", "CEO", "CFO",
+        }
+        combined = [t for t in dollar_tickers + caps_words if t.upper() not in SKIP]
+        return list(dict.fromkeys(combined))[:20]
 
     @staticmethod
-    def _extract_text_from_html(html: str) -> list[str]:
-        """Very lightweight HTML text extraction (no BeautifulSoup dependency)."""
-        # Remove script/style blocks
+    def _extract_tweets_from_nitter_html(html: str) -> list[str]:
+        """Extract tweet content from Nitter HTML response."""
+        # Remove script/style
         html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
         html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
-        # Remove HTML tags
-        text = re.sub(r"<[^>]+>", " ", html)
-        # Collapse whitespace
-        text = re.sub(r"\s+", " ", text).strip()
-        # Split into chunks (tweet-like segments)
-        sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 20]
-        return sentences[:50]
+        # Extract tweet-content divs
+        tweet_blocks = re.findall(
+            r'class="tweet-content[^"]*"[^>]*>(.*?)</div>',
+            html, re.DOTALL
+        )
+        if not tweet_blocks:
+            # Fallback: extract all text
+            text = re.sub(r"<[^>]+>", " ", html)
+            text = re.sub(r"\s+", " ", text)
+            return [s.strip() for s in text.split(".") if len(s.strip()) > 30][:30]
+
+        results = []
+        for block in tweet_blocks:
+            clean = re.sub(r"<[^>]+>", " ", block)
+            clean = re.sub(r"\s+", " ", clean).strip()
+            if len(clean) > 20:
+                results.append(clean)
+        return results
+
+    @staticmethod
+    def _humanize_topic(anchor: str, related: list[str]) -> str:
+        """Create a human-readable topic label."""
+        # Use anchor + top 2 related words
+        parts = [anchor] + [w for w in related[:2] if w != anchor]
+        return " ".join(parts[:3]).title()

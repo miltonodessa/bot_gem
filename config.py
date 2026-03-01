@@ -4,7 +4,6 @@ Strategy based on wallet AF6syABApBp7d1NfjUkmKG7BBBEWVMvXadyvqQgjLnRN analysis.
 """
 import os
 from dataclasses import dataclass, field
-from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -60,8 +59,7 @@ class TradingConfig:
     narrative_refresh_minutes: int = int(os.getenv("NARRATIVE_REFRESH_MINUTES", "60"))
 
     # ── Optimal trading hours UTC (from wallet analysis) ─────────────────────
-    # Best performance: 4h, 13h, 14h, 15h UTC
-    # Worst: 6h, 8h, 12h, 22h UTC
+    # Best: 4h, 13h, 14h, 15h UTC  |  Worst: 6h, 8h, 12h, 22h UTC
     optimal_hours_utc: list = field(default_factory=lambda: [4, 13, 14, 15, 16, 17])
     avoid_hours_utc: list = field(default_factory=lambda: [6, 8, 12, 22, 23])
 
@@ -70,65 +68,43 @@ class TradingConfig:
     usdc_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
     # ── Strategy rules (from analysis) ────────────────────────────────────────
-    # NEVER add to a position (1 buy = 79% WR, 2+ buys = 45% WR)
-    allow_dca: bool = False
-    # Prefer Jupiter → pump.fun routing (74% of winning trades)
-    prefer_pump_routing: bool = True
-    # Minimum narrative score to enter a trade
-    min_narrative_score: float = 0.6
-    # Minimum liquidity
+    allow_dca: bool = False          # NEVER add to position (2+ buys = 45% WR)
+    prefer_pump_routing: bool = True  # Jupiter→pump.fun = 74% of winning trades
+    min_narrative_score: float = 0.4  # lowered vs static categories (dynamic is noisier)
     min_liquidity_usd: float = 3000.0
 
 
-# ── Narrative keywords tracked on Twitter ─────────────────────────────────────
-# These are re-scored daily based on Twitter trend velocity
-BASE_NARRATIVE_CATEGORIES = {
-    "AI_AGENTS": [
-        "ai agent", "autonomous agent", "ai16z", "eliza framework",
-        "agent protocol", "ai defi", "ai trading bot", "goat"
-    ],
-    "DEPIN": [
-        "depin", "decentralized physical", "iotex", "helium", "render",
-        "akash", "livepeer", "physical infrastructure"
-    ],
-    "MEME_META": [
-        "dog wif hat", "meme season", "memecoin", "solana meme",
-        "pump fun new", "1000x gem", "low cap gem"
-    ],
-    "GAMING": [
-        "solana gaming", "play to earn", "gamefi solana", "nft gaming",
-        "onchain game", "fully onchain"
-    ],
-    "RWA": [
-        "real world asset", "tokenized", "rwa solana", "tokenized stocks",
-        "real estate token", "commodity token"
-    ],
-    "LAUNCHPAD": [
-        "new launch", "fair launch", "pump fun launch", "stealth launch",
-        "presale", "token launch today"
-    ],
-    "TRENDING_MEME": [
-        "trump", "elon", "viral", "trending", "1000x", "100x"
-    ],
-    "LAYER2_BRIDGE": [
-        "solana bridge", "cross chain", "wormhole", "allbridge",
-        "sol ecosystem"
-    ],
+# ── OG Solana memes (mint addresses) ─────────────────────────────────────────
+# Tracked for revival signals: volume/price spike = OG meme season starting.
+# When these pump → related new coins on pump.fun often follow.
+OG_SOLANA_MEMES: dict[str, str] = {
+    "BONK":   "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF":    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "POPCAT": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+    "MEW":    "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
+    "BRETT":  "BRETTQszPe4F7GnMBFAGHMQNr9JMoqMaA8HNnRzsTroy",
+    "BOME":   "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82",
+    "MYRO":   "HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4",
+    "PONKE":  "5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK31CR6ZDN",
+    "SLERF":  "7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7ByyfkZ1",
+    "GIGA":   "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9",
+    "MOODENG":"ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzc8yy",
+    "PNUT":   "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump",
+    "GOAT":   "CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump",
 }
 
-# Twitter accounts to monitor for alpha/narratives
-ALPHA_TWITTER_ACCOUNTS = [
-    "solana", "pumpdotfun", "jupiterexchange", "raydium_io",
-    "heliumsystems", "render_token", "HsakaTrades", "CryptoKaleo",
-    "AltcoinSherpa", "WClementeIII", "inversebrah", "DegenSpartan",
-    "gainzy222", "CryptoGodJohn", "Rewkang",
-]
-
-# Hashtags to monitor
-TRENDING_HASHTAGS = [
-    "#Solana", "#SOL", "#memecoin", "#pumpfun", "#depin",
-    "#aiagent", "#web3", "#crypto", "#altcoin", "#gem",
-    "#1000x", "#100x", "#newlisting", "#stealth"
+# ── Viral seed accounts (for narrative scanning) ──────────────────────────────
+# Mix of: Solana alpha callers, viral meme accounts, news accounts, crypto influencers
+VIRAL_SEED_ACCOUNTS = [
+    # Solana ecosystem
+    "pumpdotfun", "jupiterexchange", "solana", "raydium_io",
+    # Crypto alpha / callers
+    "HsakaTrades", "CryptoKaleo", "inversebrah", "DegenSpartan",
+    "gainzy222", "CryptoGodJohn", "Rewkang", "AltcoinSherpa",
+    # High-engagement general accounts (generate meme content)
+    "elonmusk", "realDonaldTrump", "unusual_whales",
+    # News / viral
+    "BreakingNews", "disclosetv", "CollinRugg",
 ]
 
 config = TradingConfig()
