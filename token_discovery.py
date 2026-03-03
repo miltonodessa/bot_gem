@@ -20,6 +20,7 @@ Every viral event potentially has its own "OG" tokens — we discover them live.
 
 import asyncio
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -136,6 +137,69 @@ class TokenDiscovery:
     _FALLBACK_SKIP_WORDS = {"sol", "meme", "doge", "pepe", "frog", "cat", "dog",
                             "moon", "gem", "ape", "pump", "solana"}
 
+    # ── Animal filter ──────────────────────────────────────────────────────
+    # Only trade tokens whose name/symbol clearly refers to an animal.
+    # Includes mammals, fish, birds, reptiles, insects, sea creatures,
+    # Japanese animal terms, and popular crypto-meme animals.
+    _ANIMAL_KEYWORDS: frozenset = frozenset({
+        # Dogs
+        "dog", "doge", "shib", "shiba", "inu", "puppy", "pup", "hound",
+        "husky", "corgi", "poodle", "bulldog", "pug", "akita", "samoyed",
+        "floki", "samo", "bonk",
+        # Cats
+        "cat", "neko", "kitty", "kitten", "meow", "feline", "maneki",
+        "tabby", "popcat",
+        # Bears
+        "bear", "kuma", "panda", "koala", "grizzly", "polar", "teddy",
+        # Primates
+        "ape", "monkey", "chimp", "gorilla", "orangutan", "baboon", "lemur",
+        # Sea mammals
+        "whale", "dolphin", "porpoise", "orca", "seal", "walrus", "manatee",
+        "narwhal", "beluga", "otter",
+        # Fish & sea creatures
+        "fish", "shark", "tuna", "salmon", "carp", "koi", "nemo",
+        "shrimp", "crab", "lobster", "octopus", "squid", "jellyfish",
+        "starfish", "seahorse", "puffer", "manta", "stingray", "cuttlefish",
+        "clownfish", "anglerfish",
+        # Birds
+        "bird", "eagle", "hawk", "owl", "parrot", "penguin", "flamingo",
+        "toucan", "crow", "raven", "pigeon", "duck", "goose", "swan",
+        "peacock", "falcon", "robin", "sparrow", "chicken", "rooster",
+        "condor", "pelican", "heron",
+        # Reptiles & amphibians
+        "frog", "pepe", "toad", "snake", "gecko", "lizard", "crocodile",
+        "croc", "turtle", "tortoise", "iguana", "chameleon", "axolotl",
+        "newt", "salamander",
+        # Rodents
+        "rat", "mouse", "hamster", "squirrel", "beaver", "capybara", "capy",
+        "gerbil", "marmot", "chipmunk",
+        # Farm animals
+        "cow", "bull", "horse", "pig", "goat", "sheep", "lamb", "donkey",
+        "mule", "ox", "buffalo", "bison",
+        # Wild mammals
+        "wolf", "fox", "lion", "tiger", "leopard", "cheetah", "jaguar",
+        "elephant", "rhino", "hippo", "giraffe", "zebra", "deer", "moose",
+        "elk", "camel", "llama", "alpaca", "kangaroo", "wombat", "wallaby",
+        "platypus", "quokka", "hedgehog", "porcupine", "skunk", "badger",
+        "weasel", "ferret", "raccoon", "meerkat", "mongoose", "hyena",
+        "jackal", "dingo", "coyote", "lynx", "bobcat", "puma", "cougar",
+        "ocelot", "serval", "cheetah", "panther",
+        # Insects & bugs
+        "bee", "ant", "butterfly", "moth", "beetle", "wasp", "dragonfly",
+        "firefly", "cricket", "grasshopper", "caterpillar", "worm",
+        # Exotic
+        "sloth", "pangolin", "anteater", "armadillo", "tapir", "okapi",
+        "tarsier", "loris", "pika", "aardvark",
+        # Japanese animal terms
+        "kitsune", "tanuki", "usagi", "tora", "koi", "shishi", "raiju",
+        "uma",    # horse
+        # Meme/crypto culture animals
+        "giga",   # gigachad often depicted as animal-like meme
+        "popcat", "bonk", "floki", "samo", "wif",  # dogwifhat
+        # Generic creature terms
+        "creature", "beast", "critter", "animal", "wildlife", "zoo",
+    })
+
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -224,9 +288,17 @@ class TokenDiscovery:
 
         logger.info(f"Raw candidates before filter: {len(unique)}")
 
-        # Apply filters
+        # Sync hard filters (MC, liquidity, age)
         filtered = [c for c in unique if self._passes_hard_filters(c)]
         logger.info(f"Candidates after hard filters: {len(filtered)}")
+
+        # Async filters (animal name + dev token count) — run concurrently
+        if filtered:
+            checks = await asyncio.gather(
+                *[self._passes_async_filters(c) for c in filtered]
+            )
+            filtered = [c for c, ok in zip(filtered, checks) if ok]
+            logger.info(f"Candidates after animal+dev filters: {len(filtered)}")
 
         # Score each candidate against narrative
         for candidate in filtered:
@@ -788,6 +860,84 @@ class TokenDiscovery:
         except Exception as e:
             logger.debug(f"Birdeye parse error: {e}")
             return None
+
+    # ── Animal & dev filters ──────────────────────────────────────────────────
+
+    def _is_animal_token(self, c: TokenCandidate) -> bool:
+        """
+        Returns True if the token name or symbol refers to an animal.
+        Handles compound names like "IrrawaddyDolphin", hyphenated like
+        "if-chan", and Japanese terms like "neko", "inu", "kuma".
+        """
+        # Normalize: lowercase, split on spaces / hyphens / underscores / dots
+        raw = f"{c.name} {c.symbol}".lower()
+        words = set(re.split(r"[\s\-_\.]+", raw))
+        # Also check the no-separator form for compounds ("irrawaddydolphin")
+        concat = re.sub(r"[\s\-_\.]", "", raw)
+
+        for kw in self._ANIMAL_KEYWORDS:
+            if kw in words:       # exact word match ("dog", "whale" …)
+                return True
+            if kw in concat:      # substring in compound ("dolphin" in "irrawaddydolphin")
+                return True
+        return False
+
+    async def _get_dev_token_count(self, mint: str) -> int:
+        """
+        Returns how many tokens this token's developer has created on pump.fun.
+        Fetches 6 entries — if all 6 return, the dev has ≥6 tokens → reject.
+        Returns 0 for non-pump.fun tokens or on API error (fail-open).
+        """
+        if not self._session:
+            return 0
+        try:
+            # Step 1: resolve creator address for this mint
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return 0   # not a pump.fun token — skip check
+                data = await resp.json()
+                creator = data.get("creator")
+                if not creator:
+                    return 0
+
+            # Step 2: count tokens created by this wallet (fetch 6; if 6 → ≥6 → over limit)
+            url = (
+                f"https://frontend-api.pump.fun/coins/user-created-coins/{creator}"
+                f"?offset=0&limit=6"
+            )
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return 0   # API unavailable — fail-open
+                coins = await resp.json()
+                count = len(coins) if isinstance(coins, list) else 0
+                logger.debug(f"Dev {creator[:8]}… created {count} token(s)")
+                return count
+        except Exception as e:
+            logger.debug(f"Dev token count {mint[:8]}: {e}")
+            return 0   # fail-open on error
+
+    async def _passes_async_filters(self, c: TokenCandidate) -> bool:
+        """
+        Async filters applied after the sync hard filters.
+        1. Token must reference an animal (name or symbol)
+        2. Dev wallet must have created ≤ 5 tokens on pump.fun
+        """
+        # ── 1. Animal filter ──────────────────────────────────────────────
+        if not self._is_animal_token(c):
+            logger.debug(f"Skip {c.symbol}: not an animal token (name='{c.name}')")
+            return False
+
+        # ── 2. Dev token count (pump.fun tokens only) ────────────────────
+        if c.is_pump_fun or c.source in ("pump_fun", "narrative_og"):
+            dev_count = await self._get_dev_token_count(c.mint)
+            if dev_count > 5:
+                logger.info(
+                    f"Skip {c.symbol}: dev has {dev_count} tokens (limit=5) | {c.mint}"
+                )
+                return False
+
+        return True
 
     # ── Scoring / filtering ───────────────────────────────────────────────────
 
