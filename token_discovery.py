@@ -137,6 +137,16 @@ class TokenDiscovery:
     _FALLBACK_SKIP_WORDS = {"sol", "meme", "doge", "pepe", "frog", "cat", "dog",
                             "moon", "gem", "ape", "pump", "solana"}
 
+    # ── Japanese / Korean script detector ─────────────────────────────────
+    # Matches any Hiragana, Katakana, CJK ideograph (Kanji/Hanja), or Hangul.
+    _JP_KR_PATTERN: re.Pattern = re.compile(
+        r"[\u3040-\u30ff"   # Hiragana (3040–309F) + Katakana (30A0–30FF)
+        r"\u4e00-\u9fff"    # CJK Unified Ideographs — Kanji / Hanja
+        r"\uac00-\ud7a3"    # Hangul Syllables
+        r"\u1100-\u11ff"    # Hangul Jamo
+        r"\u3130-\u318f]"   # Hangul Compatibility Jamo
+    )
+
     # ── Animal filter ──────────────────────────────────────────────────────
     # Only trade tokens whose name/symbol clearly refers to an animal.
     # Includes mammals, fish, birds, reptiles, insects, sea creatures,
@@ -917,13 +927,23 @@ class TokenDiscovery:
             logger.debug(f"Dev token count {mint[:8]}: {e}")
             return 0   # fail-open on error
 
+    def _has_jp_kr_name(self, c: TokenCandidate) -> bool:
+        """Returns True if the token name contains Japanese or Korean characters."""
+        return bool(self._JP_KR_PATTERN.search(c.name))
+
     async def _passes_async_filters(self, c: TokenCandidate) -> bool:
         """
         Async filters applied after the sync hard filters.
-        1. Token must reference an animal (name or symbol)
-        2. Dev wallet must have created ≤ 5 tokens on pump.fun
+        1. Token name must contain Japanese or Korean script
+        2. Token must reference an animal (name or symbol)
+        3. Dev wallet must have created ≤ 5 tokens on pump.fun
         """
-        # ── 1. Animal filter ──────────────────────────────────────────────
+        # ── 1. Japanese / Korean script ───────────────────────────────────
+        if not self._has_jp_kr_name(c):
+            logger.debug(f"Skip {c.symbol}: no JP/KR script in name '{c.name}'")
+            return False
+
+        # ── 2. Animal filter ──────────────────────────────────────────────
         if not self._is_animal_token(c):
             logger.debug(f"Skip {c.symbol}: not an animal token (name='{c.name}')")
             return False
