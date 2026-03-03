@@ -19,6 +19,7 @@ Every viral event potentially has its own "OG" tokens — we discover them live.
 """
 
 import asyncio
+import base64
 import math
 import re
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
+from anthropic import AsyncAnthropic
 from loguru import logger
 
 from config import config
@@ -76,6 +78,7 @@ class TokenCandidate:
     entry_score: float = 0.0    # final composite score
     is_narrative_og: bool = False   # True = existing token pumping on this narrative
     og_signal: Optional["NarrativeOGSignal"] = None
+    image_uri: str = ""             # token logo URL (from pump.fun API)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -210,8 +213,13 @@ class TokenDiscovery:
         "creature", "beast", "critter", "animal", "wildlife", "zoo",
     })
 
+    # Cache: image_uri → bool (animal detected).  Bounded to 500 entries.
+    _IMAGE_CACHE_MAX = 500
+
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
+        self._anthropic: Optional[AsyncAnthropic] = None
+        self._image_cache: dict[str, bool] = {}
 
     async def __aenter__(self):
         # ssl=False fixes SSL certificate errors on macOS (missing root certs).
@@ -224,6 +232,8 @@ class TokenDiscovery:
                 "Accept": "application/json",
             }
         )
+        if config.anthropic_api_key:
+            self._anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
         return self
 
     async def __aexit__(self, *args):
@@ -808,6 +818,7 @@ class TokenDiscovery:
                 holder_count=int(coin.get("holder_count", 0)),
                 is_pump_fun=True,
                 source="pump_fun",
+                image_uri=coin.get("image_uri", ""),
             )
         except Exception as e:
             logger.debug(f"pump.fun parse error: {e}")
@@ -873,6 +884,83 @@ class TokenDiscovery:
 
     # ── Animal & dev filters ──────────────────────────────────────────────────
 
+    async def _is_animal_image(self, c: TokenCandidate) -> bool:
+        """
+        Sends the token's logo to Claude Haiku and asks whether it shows an animal
+        (including fictional creatures like unicorns and dragons).
+
+        Falls back to False when:
+        - No ANTHROPIC_API_KEY is configured
+        - The token has no image_uri
+        - Network / API errors
+        """
+        if not self._anthropic or not c.image_uri:
+            return False
+
+        # Return cached result if available
+        cached = self._image_cache.get(c.image_uri)
+        if cached is not None:
+            return cached
+
+        try:
+            async with self._session.get(
+                c.image_uri,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                img_bytes = await resp.read(1_500_000)  # max ~1.5 MB
+                content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+
+            if content_type not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+                content_type = "image/jpeg"
+
+            img_b64 = base64.standard_b64encode(img_bytes).decode()
+
+            msg = await self._anthropic.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=5,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": content_type,
+                                "data": img_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Does this image show an animal or creature "
+                                "(including fictional ones like unicorns or dragons)? "
+                                "Reply YES or NO only."
+                            ),
+                        },
+                    ],
+                }],
+            )
+
+            result = msg.content[0].text.strip().upper().startswith("YES")
+            logger.debug(
+                f"Image vision [{c.symbol}] '{c.name}' → {'ANIMAL' if result else 'not animal'}"
+            )
+
+            # Bound cache size
+            if len(self._image_cache) >= self._IMAGE_CACHE_MAX:
+                # Drop oldest ~10 % of entries
+                drop = list(self._image_cache)[:self._IMAGE_CACHE_MAX // 10]
+                for k in drop:
+                    del self._image_cache[k]
+            self._image_cache[c.image_uri] = result
+            return result
+
+        except Exception as e:
+            logger.debug(f"Image vision error for {c.symbol}: {e}")
+            return False
+
     def _is_animal_token(self, c: TokenCandidate) -> bool:
         """
         Returns True if the token name or symbol refers to an animal.
@@ -935,7 +1023,7 @@ class TokenDiscovery:
         """
         Async filters applied after the sync hard filters.
         1. Token name must contain Japanese or Korean script
-        2. Token must reference an animal (name or symbol)
+        2. Token must reference an animal — by name/symbol OR by image (Claude Haiku vision)
         3. Dev wallet must have created ≤ 5 tokens on pump.fun
         """
         # ── 1. Japanese / Korean script ───────────────────────────────────
@@ -943,12 +1031,18 @@ class TokenDiscovery:
             logger.debug(f"Skip {c.symbol}: no JP/KR script in name '{c.name}'")
             return False
 
-        # ── 2. Animal filter ──────────────────────────────────────────────
+        # ── 2. Animal filter (name OR image) ──────────────────────────────
+        # Fast path: keyword match on name/symbol — no API call needed.
+        # Slow path: if no keyword match, ask Claude Haiku to look at the logo.
         if not self._is_animal_token(c):
-            logger.debug(f"Skip {c.symbol}: not an animal token (name='{c.name}')")
-            return False
+            if not await self._is_animal_image(c):
+                logger.debug(
+                    f"Skip {c.symbol}: not an animal (name='{c.name}', image not animal)"
+                )
+                return False
+            logger.info(f"{c.symbol} '{c.name}': animal detected via image (no keyword match)")
 
-        # ── 2. Dev token count (pump.fun tokens only) ────────────────────
+        # ── 3. Dev token count (pump.fun tokens only) ────────────────────
         if c.is_pump_fun or c.source in ("pump_fun", "narrative_og"):
             dev_count = await self._get_dev_token_count(c.mint)
             if dev_count > 5:

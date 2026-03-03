@@ -28,6 +28,9 @@ class TradingConfig:
     twitter_access_token: str = os.getenv("TWITTER_ACCESS_TOKEN", "")
     twitter_access_secret: str = os.getenv("TWITTER_ACCESS_SECRET", "")
 
+    # ── Anthropic (vision filter for token images) ────────────────────────────
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+
     # ── Data APIs ─────────────────────────────────────────────────────────────
     helius_api_key: str = os.getenv("HELIUS_API_KEY", "")
     dexscreener_api: str = os.getenv("DEXSCREENER_API", "https://api.dexscreener.com/latest/dex")
